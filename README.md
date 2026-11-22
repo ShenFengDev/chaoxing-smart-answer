@@ -1,7 +1,7 @@
 [README.md](https://github.com/user-attachments/files/35226441/README.md)
 # 超星智答 · ChaoxingSmartAnswer
 
-> 学习通自动答题助手：**6 大题库并行 + AI 双引擎**，带语境注入、答案复核与接口可视化。
+> 学习通自动答题、刷课的助手：**6 大题库并行 + AI 双引擎**，带语境注入、答案复核与接口可视化。
 
 [![version](https://img.shields.io/badge/version-2.2.0-blue)]()
 [![platform](https://img.shields.io/badge/platform-Tampermonkey-orange)]()
