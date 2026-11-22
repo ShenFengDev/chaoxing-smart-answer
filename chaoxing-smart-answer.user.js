@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         超星智答 · 学习通自动答题助手（题库+AI双引擎）
-// @namespace    https://github.com/YOUR_GITHUB_NAME/chaoxing-smart-answer
-// @version      2.2.0
-// @author       YOUR_NAME（基于 shushoujiu 的「超星学习通满分助手」二次开发）
+// @namespace    https://github.com/ShenFengDev/chaoxing-smart-answer
+// @version      1.0.0
+// @author       ShenFengDev（基于 shushoujiu 的「超星学习通满分助手」二次开发）
 // @description  超星学习通自动答题：6大题库并行 + AI 作答，自动注入课程名/章节/大题语境；答完多库投票复核；章节任务点、作业、考试、讨论全自动；内置接口日志面板与暂停开关。
-// @homepageURL  https://github.com/YOUR_GITHUB_NAME/chaoxing-smart-answer
-// @supportURL   https://github.com/YOUR_GITHUB_NAME/chaoxing-smart-answer/issues
+// @homepageURL  https://github.com/ShenFengDev/chaoxing-smart-answer
+// @supportURL   https://github.com/ShenFengDev/chaoxing-smart-answer/issues
 // @license      MIT
 // @icon         https://vitejs.dev/logo.svg
 // @match        *://*.chaoxing.com/*
@@ -42,9 +42,8 @@
 // @grant        unsafeWindow
 // @run-at       document-end
 // @antifeature  payment  脚本可选接入第三方付费题库（不填密钥则完全不使用）
-// @downloadURL  https://raw.githubusercontent.com/YOUR_GITHUB_NAME/chaoxing-smart-answer/main/chaoxing-smart-answer.user.js
-// @updateURL    https://raw.githubusercontent.com/YOUR_GITHUB_NAME/chaoxing-smart-answer/main/chaoxing-smart-answer.user.js
-// ==/UserScript==
+// @downloadURL  https://raw.githubusercontent.com/ShenFengDev/chaoxing-smart-answer/main/chaoxing-smart-answer.user.js
+// @updateURL    https://raw.githubusercontent.com/ShenFengDev/chaoxing-smart-answer/main/chaoxing-smart-answer.user.js
 // ==/UserScript==
 
 (t=>{if(typeof GM_addStyle=="function"){GM_addStyle(t);return}const i=document.createElement("style");i.textContent=t,document.head.append(i)})(" .dialog-footer button[data-v-6ed29f7f]:first-child{margin-right:10px}#csbutton[data-v-6ed29f7f]{position:fixed;bottom:20px;right:20px;z-index:99999}#zeokdjg[data-v-c3c6b09f]{position:fixed;left:10px;bottom:50vh;z-index:9999}.question_btn[data-v-c3c6b09f]{width:40px;height:40px;border-radius:5px;margin:5px}.question_div[data-v-c3c6b09f]{height:200px}.question_ti[data-v-c3c6b09f]{margin:10px 0 20px}.cx_log[data-v-c3c6b09f]{margin:2px 0}.status_log[data-v-c3c6b09f]{margin-top:10px}.dialog-footer button[data-v-c3c6b09f]:first-child{margin-right:10px}#csbutton[data-v-c3c6b09f]{position:fixed;bottom:20px;right:20px;z-index:99999} ");
