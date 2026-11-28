@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星智答 · 学习通自动答题助手（题库+AI双引擎）
 // @namespace    https://github.com/ShenFengDev/chaoxing-smart-answer
-// @version      1.0.0
+// @version      1.1.0
 // @author       ShenFengDev（基于 shushoujiu 的「超星学习通满分助手」二次开发）
 // @description  超星学习通自动答题：6大题库并行 + AI 作答，自动注入课程名/章节/大题语境；答完多库投票复核；章节任务点、作业、考试、讨论全自动；内置接口日志面板与暂停开关。
 // @homepageURL  https://github.com/ShenFengDev/chaoxing-smart-answer
@@ -33,6 +33,7 @@
 // @connect      localhost
 // @connect      127.0.0.1
 // @connect      *
+// @grant        GM_addValueChangeListener
 // @grant        GM_addStyle
 // @grant        GM_getResourceText
 // @grant        GM_getValue
@@ -62,6 +63,60 @@
     GM_addStyle(t);
   })("element-plus");
   var _GM_getResourceText = (() => "undefined" != typeof GM_getResourceText ? GM_getResourceText : void 0)(), _GM_getValue = (() => "undefined" != typeof GM_getValue ? GM_getValue : void 0)(), _GM_info = (() => "undefined" != typeof GM_info ? GM_info : void 0)(), _GM_setValue = (() => "undefined" != typeof GM_setValue ? GM_setValue : void 0)(), _GM_xmlhttpRequest = (() => "undefined" != typeof GM_xmlhttpRequest ? GM_xmlhttpRequest : void 0)(), _unsafeWindow = (() => "undefined" != typeof unsafeWindow ? unsafeWindow : void 0)();
+  const AIProtocol = {
+    type(config) {
+      return ["openai-chat", "openai-responses", "anthropic"].includes(config.aiApiType) ? config.aiApiType : "openai-chat";
+    },
+    endpoint(config, models = false) {
+      const url = new URL(String(config.aiApiUrl || "").trim());
+      if (!/^https?:$/.test(url.protocol)) throw new Error("API地址须使用 http:// 或 https://");
+      const path = url.pathname.replace(/\/+$/, "");
+      const isLike = /(^|\.)datam\.site$/i.test(url.hostname) || /\/api\/v1\/query(?:\/models)?$/i.test(path);
+      if (isLike) {
+        url.pathname = models ? path.replace(/\/api\/v1\/query(?:\/models)?$/i, "") + "/api/v1/query/models" : path;
+      } else {
+        const hasEndpoint = /\/(?:chat\/completions|responses|messages|models)$/i.test(path);
+        let root = path.replace(/\/(?:chat\/completions|responses|messages|models)$/i, "");
+        if (!root && !hasEndpoint) root = "/v1";
+        url.pathname = root + (models ? "/models" : this.type(config) === "openai-responses" ? "/responses" : this.type(config) === "anthropic" ? "/messages" : "/chat/completions");
+      }
+      url.hash = "";
+      return url.toString();
+    },
+    headers(config) {
+      return this.type(config) === "anthropic" ? { "Content-Type": "application/json", "x-api-key": config.aiApiKey || "", "anthropic-version": "2023-06-01" } : { "Content-Type": "application/json", "Authorization": "Bearer " + (config.aiApiKey || "") };
+    },
+    request(config, prompt) {
+      const model = String(config.aiModel || "").trim();
+      if (!model) throw new Error("请填写AI模型名称");
+      const type = this.type(config);
+      const body = type === "openai-responses" ? { model, input: prompt, stream: false } : type === "anthropic" ? { model, max_tokens: 4096, messages: [{ role: "user", content: prompt }], stream: false } : { model, messages: [{ role: "user", content: prompt }], stream: false };
+      return { url: this.endpoint(config), method: "POST", headers: this.headers(config), data: JSON.stringify(body), timeout: 9e4 };
+    },
+    text(data, config) {
+      const blocks = (content) => typeof content === "string" ? content : Array.isArray(content) ? content.filter((part) => part && (part.type === "text" || part.type === "output_text" || !part.type)).map((part) => typeof part === "string" ? part : typeof part.text === "string" ? part.text : "").join("\n") : "";
+      if (this.type(config) === "openai-responses") {
+        return typeof data.output_text === "string" ? data.output_text : (data.output || []).filter((item) => item.type === "message").map((item) => blocks(item.content)).filter(Boolean).join("\n");
+      }
+      if (this.type(config) === "anthropic") return blocks(data.content);
+      const message = data.choices && data.choices[0] && data.choices[0].message;
+      return message ? blocks(message.content) || blocks(message.reasoning_content) : "";
+    },
+    modelIds(data) {
+      const list = Array.isArray(data) ? data : data.data || data.models || [];
+      return Array.isArray(list) ? [...new Set(list.map((model) => typeof model === "string" ? model : model && (model.id || model.name)).filter((id) => typeof id === "string" && id.length > 0))] : [];
+    },
+    async fetchModels(config) {
+      const url = this.endpoint(config, true);
+      const response = await new Promise((resolve, reject) => {
+        _GM_xmlhttpRequest({ method: "GET", url, headers: this.headers(config), timeout: 2e4, onload: resolve, ontimeout: () => reject(new Error("获取模型列表超时")), onerror: (error) => reject(new Error("获取模型列表网络错误: " + (error && error.error || "未知"))) });
+      });
+      if (response.status < 200 || response.status >= 300) throw new Error("获取模型列表失败: HTTP " + response.status);
+      const ids = this.modelIds(JSON.parse(response.responseText));
+      if (!ids.length) throw new Error("接口未返回模型列表，请手动填写模型名称");
+      return ids;
+    }
+  };
   const getConfig = () => {
     let config = _GM_getValue("config");
     if (!config) return defaultConfig$1;
@@ -74,84 +129,35 @@
       _GM_setValue("config", config);
     }
     return config;
-  }, defaultConfig$1 = { debugger: false, autoAnswer: true, autoVideo: true, autoJump: true, redoFinished: true, autoDiscuss: true, autoSubmit: true, thtoken: "", yztoken: "", gptKey: "", gptModel: "gpt-3.5-turbo", gpt: false, gptType: ["0", "1", "2", "3", "4", "5", "6", "7"], interval: 3, answerIntervalMin: 8, answerIntervalMax: 30, submitDelayMin: 20, submitDelayMax: 40, minAccuracy: 0.8, autoExam: true, examEnabled: true, examAutoSubmit: false, verifyAnswers: true, verifyAutoFix: true, hideExam: false, notice: "本脚本仅供学习交流使用，严禁用于商业用途，否则后果自负！", deepseekKey: "", deepseekEnabled: false, deepseekModel: "deepseek-reasoner", customApiUrl: "", customApiKey: "", customApiEnabled: false, aiEnabled: false, aiApiKey: "", aiApiUrl: "https://api.deepseek.com/v1/chat/completions", aiModel: "deepseek-reasoner", aiOnly: false, likeSearch: false, datamBank: true, datamModel: "deepseek-v3.2", zetoken: "", bankEnabled: ["tkh", "yzt", "yx", "mkt", "datam", "ze"] }, modelOptionsRef = vue.ref([]), modelPresets = { "https://api.deepseek.com/v1/chat/completions": ["deepseek-chat", "deepseek-reasoner", "deepseek-v4.1-flash", "deepseek-v4-pro", "deepseek-v4-flash"], "https://api.openai.com/v1/chat/completions": ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra"], "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions": ["gemini-4-argon", "gemini-3.8-flash", "gemini-3.7-flash"], "https://qianfan.baidubce.com/v2/chat/completions": ["ernie-5.1", "ernie-5.0", "ernie-x1-turbo", "ernie-4.5-turbo-128k"], "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions": ["qwen3.8-max", "qwen3.8-flash", "qwen3.8-omni-flash"], "https://api.moonshot.cn/v1/chat/completions": ["kimi-k3", "kimi-k2.6"], "https://open.bigmodel.cn/api/paas/v4/chat/completions": ["glm-5.3", "glm-5.3-flash", "glm-5.2"], "https://api.minimaxi.com/v1/chat/completions": ["MiniMax-M3.1-Flash", "MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"], "https://token.sensenova.cn/v1/chat/completions": ["sensenova-6.7-flash-lite"], "https://api.xiaomimimo.com/v1/chat/completions": ["mimo-v2.6-pro", "mimo-v2.6-flash", "mimo-v2.5-pro", "mimo-v2.5"], "https://ark.cn-beijing.volces.com/api/v3/chat/completions": ["doubao-seed-2.0-pro", "doubao-seed-2.0-mini", "doubao-seed-2.0-lite", "doubao-seed-1.6"] }, userConfig = [{ name: "base", label: "基础配置", config: [{ name: "interval", label: "通用间隔(秒)", type: "number", value: defaultConfig$1.interval, desc: "通用间隔，用于脚本运行切换" }, { name: "answerIntervalMin", label: "答题间隔最小值(秒)", type: "number", value: defaultConfig$1.answerIntervalMin, desc: "每道题之间的最小等待时间" }, { name: "answerIntervalMax", label: "答题间隔最大值(秒)", type: "number", value: defaultConfig$1.answerIntervalMax, desc: "每道题之间的最大等待时间" }, { name: "submitDelayMin", label: "提交前延迟最小值(秒)", type: "number", value: defaultConfig$1.submitDelayMin, desc: "全部答完题后提交前的最小等待时间" }, { name: "submitDelayMax", label: "提交前延迟最大值(秒)", type: "number", value: defaultConfig$1.submitDelayMax, desc: "全部答完题后提交前的最大等待时间" }, { name: "customApiEnabled", label: "启用自定义题库", type: "switch", value: defaultConfig$1.customApiEnabled, desc: "开启后，自定义题库最优先查询（命中即用），命中不了才走AI/在线题库" }, { name: "customApiUrl", label: "自定义题库地址", type: "input", value: defaultConfig$1.customApiUrl, desc: "POST接口地址，如 http://localhost:8080/api/query（不写 http:// 会自动补全）" }, { name: "customApiKey", label: "自定义题库密钥", type: "input", value: defaultConfig$1.customApiKey, desc: "这里填「自定义题库」或「在线题库(LIKE知识库/datam.site)」的 API 密钥；LIKE 题库会读取此处的密钥，同时以 Bearer 请求头和 key 字段发送" }, { name: "aiEnabled", label: "启用AI自动答题", type: "switch", value: defaultConfig$1.aiEnabled, desc: "开启后，AI优先作答；AI没答上时回退题库（配合'仅AI模式'可完全不查题库）" }, { name: "aiApiUrl", label: "AI服务商/接口地址", type: "select", value: defaultConfig$1.aiApiUrl, options: [{ label: "DeepSeek", value: "https://api.deepseek.com/v1/chat/completions" }, { label: "OpenAI", value: "https://api.openai.com/v1/chat/completions" }, { label: "Google Gemini", value: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions" }, { label: "阿里通义千问", value: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions" }, { label: "月之暗面 Kimi", value: "https://api.moonshot.cn/v1/chat/completions" }, { label: "智谱 GLM", value: "https://open.bigmodel.cn/api/paas/v4/chat/completions" }, { label: "百度文心(千帆)", value: "https://qianfan.baidubce.com/v2/chat/completions" }, { label: "字节豆包(方舟)", value: "https://ark.cn-beijing.volces.com/api/v3/chat/completions" }, { label: "MiniMax", value: "https://api.minimaxi.com/v1/chat/completions" }, { label: "商汤日日新", value: "https://token.sensenova.cn/v1/chat/completions" }, { label: "小米 MiMo", value: "https://api.xiaomimimo.com/v1/chat/completions" }], desc: "选择服务商自动带出模型列表；自定义OpenAI兼容地址可直接输入(回车确认)。注：datam.site 属在线题库，已并入题库渠道，不在此选择" }, { name: "aiModel", label: "AI模型名称", type: "select", get options() { return modelOptionsRef.value; }, value: defaultConfig$1.aiModel, desc: "选择服务商自动带出预设模型；点弹窗底部'获取模型列表'可拉取该密钥实际可用的模型；也可手动输入模型名" }, { name: "aiApiKey", label: "AI API密钥", type: "input", value: defaultConfig$1.aiApiKey, desc: "API密钥，填写完请保存再刷新页面" }, { name: "aiOnly", label: "仅AI模式", type: "switch", value: defaultConfig$1.aiOnly, desc: "开启后只用AI答题，完全不查询题库（含自定义题库与在线题库）；AI没答上也不回退" }] }, { name: "chapter", label: "章节配置", config: [{ name: "autoAnswer", label: "自动答题", type: "switch", value: defaultConfig$1.autoAnswer, desc: "开启后，会自动答题" }, { name: "autoVideo", label: "自动视频", type: "switch", value: defaultConfig$1.autoVideo, desc: "开启后，会自动观看视频" }, { name: "autoJump", label: "自动切换", type: "switch", value: defaultConfig$1.autoVideo, desc: "开启后，会自动切换章节" }, { name: "redoFinished", label: "重做已完成任务点", type: "switch", value: defaultConfig$1.redoFinished, desc: "开启后，即使任务点已被标记完成也重新处理一遍（视频/音频已完成的会立刻跳过，耗时很短；文档会重新滚动）；关闭则严格跳过已完成任务点" }, { name: "autoDiscuss", label: "自动完成讨论", type: "switch", value: defaultConfig$1.autoDiscuss, desc: "开启后，遇到讨论题(insertbbs)会用AI生成简短发言并提交；会参考其他同学的观点，语言跟随题目（英文题用英文）。需先启用AI并填密钥" }, { name: "autoSubmit", label: "自动提交", type: "switch", value: defaultConfig$1.autoSubmit, desc: "开启后，会自动提交答案" }, { name: "minAccuracy", label: "最低正确率", type: "input", value: defaultConfig$1.minAccuracy, desc: "不满足最低正确率则不会自动提交答案" }, { name: "verifyAnswers", label: "题库复核答案", type: "switch", value: defaultConfig$1.verifyAnswers, desc: "开启后，答完全部题目会再用题库交叉检查一遍（章节/作业在最后复核，考试因翻页无法回填改为每题填完立即复核）" }, { name: "verifyAutoFix", label: "复核不一致时自动修正", type: "switch", value: defaultConfig$1.verifyAutoFix, desc: "开启后，当两个及以上题库给出的答案与当前填写不一致时，自动改成题库答案" }] }, { name: "exam", label: "作业/考试配置", config: [{ name: "examEnabled", label: "考试自动答题", type: "switch", value: defaultConfig$1.examEnabled, desc: "开启后，自动识别考试/测验作答页并整卷作答；关闭则完全跳过考试页" }, { name: "autoExam", label: "考试自动切换", type: "switch", value: defaultConfig$1.autoExam, desc: "开启后，答完当前题自动点'下一题'继续；关闭则等你手动切换，切到新题后自动作答" }, { name: "examAutoSubmit", label: "考试自动交卷", type: "switch", value: defaultConfig$1.examAutoSubmit, desc: "开启后，全部题目答完自动走整卷预览并点击交卷；交卷不可撤回，谨慎开启" }] }, { name: "banks", label: "在线题库", config: [{ name: "bankEnabled", label: "启用哪些在线题库", type: "checkbox", value: defaultConfig$1.bankEnabled, options: [{ label: "题库海", value: "tkh" }, { label: "一之题库", value: "yzt" }, { label: "言溪题库", value: "yx" }, { label: "muketool", value: "mkt" }, { label: "LIKE知识库(datam.site)", value: "datam" }, { label: "ZE题库(zerror)", value: "ze" }], desc: "勾选后参与答题查询与答案复核；取消勾选即完全不请求该题库。LIKE知识库与ZE题库需在下方填各自密钥" }, { name: "zetoken", label: "ZE题库密钥", type: "input", value: defaultConfig$1.zetoken, desc: "ZError 在线题库的 API Token（在 tiku.zerror.cc 的 我的→题库配置 获取）" }, { name: "datamModel", label: "LIKE题库模型", type: "select", value: defaultConfig$1.datamModel, options: [{ label: "deepseek-v3.2", value: "deepseek-v3.2" }, { label: "deepseek-v3.1", value: "deepseek-v3.1" }, { label: "deepseek-v3", value: "deepseek-v3" }, { label: "glm-4.5", value: "glm-4.5" }, { label: "glm-4.5-air", value: "glm-4.5-air" }, { label: "gemini-2.5-pro", value: "gemini-2.5-pro" }, { label: "gemini-2.5-flash", value: "gemini-2.5-flash" }, { label: "gpt-5", value: "gpt-5" }, { label: "qwen-max", value: "qwen-max" }, { label: "qwen-plus", value: "qwen-plus" }, { label: "qwen-turbo", value: "qwen-turbo" }], desc: "LIKE知识库答题所用模型，可下拉选择或手动输入" }, { name: "likeSearch", label: "LIKE题库·联网搜索", type: "switch", value: defaultConfig$1.likeSearch, desc: "仅对 LIKE知识库(datam.site) 生效；开启后服务端联网检索再作答，更准但更慢、更耗点数" }] }], useformStore = pinia$1.defineStore({ id: "formstore", state: () => ({ forminput: getConfig(), dialogV: false, activeName: "base" }), actions: { saveConfig(forminput) {
+  }, defaultConfig$1 = { debugger: false, autoAnswer: true, autoVideo: true, autoJump: true, redoFinished: true, autoDiscuss: true, autoSubmit: true, thtoken: "", yztoken: "", gptKey: "", gptModel: "gpt-3.5-turbo", gpt: false, gptType: ["0", "1", "2", "3", "4", "5", "6", "7"], interval: 3, answerIntervalMin: 8, answerIntervalMax: 30, submitDelayMin: 20, submitDelayMax: 40, minAccuracy: 0.8, autoExam: true, examEnabled: true, examAutoSubmit: false, verifyAnswers: true, verifyAutoFix: true, hideExam: false, notice: "本脚本仅供学习交流使用，严禁用于商业用途，否则后果自负！", deepseekKey: "", deepseekEnabled: false, deepseekModel: "deepseek-reasoner", customApiUrl: "", customApiKey: "", customApiEnabled: false, aiEnabled: false, aiApiType: "openai-chat", aiApiKey: "", aiApiUrl: "https://api.deepseek.com/v1/chat/completions", aiModel: "deepseek-reasoner", aiOnly: false, likeSearch: false, datamBank: true, datamModel: "deepseek-v3.2", zetoken: "", bankEnabled: ["tkh", "yzt", "yx", "mkt", "datam", "ze"] }, modelOptionsRef = vue.ref([]), userConfig = [{ name: "base", label: "基础配置", config: [{ name: "interval", label: "通用间隔(秒)", type: "number", value: defaultConfig$1.interval, desc: "通用间隔，用于脚本运行切换" }, { name: "answerIntervalMin", label: "答题间隔最小值(秒)", type: "number", value: defaultConfig$1.answerIntervalMin, desc: "每道题之间的最小等待时间" }, { name: "answerIntervalMax", label: "答题间隔最大值(秒)", type: "number", value: defaultConfig$1.answerIntervalMax, desc: "每道题之间的最大等待时间" }, { name: "submitDelayMin", label: "提交前延迟最小值(秒)", type: "number", value: defaultConfig$1.submitDelayMin, desc: "全部答完题后提交前的最小等待时间" }, { name: "submitDelayMax", label: "提交前延迟最大值(秒)", type: "number", value: defaultConfig$1.submitDelayMax, desc: "全部答完题后提交前的最大等待时间" }, { name: "customApiEnabled", label: "启用自定义题库", type: "switch", value: defaultConfig$1.customApiEnabled, desc: "开启后，自定义题库最优先查询（命中即用），命中不了才走AI/在线题库" }, { name: "customApiUrl", label: "自定义题库地址", type: "input", value: defaultConfig$1.customApiUrl, desc: "POST接口地址，如 http://localhost:8080/api/query（不写 http:// 会自动补全）" }, { name: "customApiKey", label: "自定义题库密钥", type: "input", value: defaultConfig$1.customApiKey, desc: "这里填「自定义题库」或「在线题库(LIKE知识库/datam.site)」的 API 密钥；LIKE 题库会读取此处的密钥，同时以 Bearer 请求头和 key 字段发送" }, { name: "aiEnabled", label: "启用AI自动答题", type: "switch", value: defaultConfig$1.aiEnabled, desc: "开启后，AI优先作答；AI没答上时回退题库（配合'仅AI模式'可完全不查题库）" }, { name: "aiApiType", label: "AI接口类型", type: "select", value: defaultConfig$1.aiApiType, options: [{ label: "OpenAI Chat Completions", value: "openai-chat" }, { label: "OpenAI Responses", value: "openai-responses" }, { label: "Anthropic Messages", value: "anthropic" }], desc: "按服务商文档选择协议；答题、讨论与模型列表共用此设置" }, { name: "aiApiUrl", label: "AI服务商/接口地址", type: "select", value: defaultConfig$1.aiApiUrl, options: [{ label: "DeepSeek", value: "https://api.deepseek.com/v1/chat/completions" }, { label: "OpenAI", value: "https://api.openai.com/v1/chat/completions" }, { label: "Google Gemini", value: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions" }, { label: "阿里通义千问", value: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions" }, { label: "月之暗面 Kimi", value: "https://api.moonshot.cn/v1/chat/completions" }, { label: "智谱 GLM", value: "https://open.bigmodel.cn/api/paas/v4/chat/completions" }, { label: "百度文心(千帆)", value: "https://qianfan.baidubce.com/v2/chat/completions" }, { label: "字节豆包(方舟)", value: "https://ark.cn-beijing.volces.com/api/v3/chat/completions" }, { label: "MiniMax", value: "https://api.minimaxi.com/v1/chat/completions" }, { label: "商汤日日新", value: "https://token.sensenova.cn/v1/chat/completions" }, { label: "小米 MiMo", value: "https://api.xiaomimimo.com/v1/chat/completions" }], desc: "可选择服务商或手输第三方地址后回车确认；支持基础地址（含 /v1 等前缀）和完整 /chat/completions、/responses、/messages 端点；接口类型请在上方选择" }, { name: "aiModel", label: "AI模型名称", type: "select", get options() { return modelOptionsRef.value; }, value: defaultConfig$1.aiModel, desc: "可手输模型名后回车确认；获取模型列表后选择服务商实际返回的模型，模型名称区分大小写，脚本保留你的填写值" }, { name: "aiApiKey", label: "AI API密钥", type: "input", value: defaultConfig$1.aiApiKey, desc: "API密钥，填写完请保存再刷新页面" }, { name: "aiOnly", label: "仅AI模式", type: "switch", value: defaultConfig$1.aiOnly, desc: "开启后只用AI答题，完全不查询题库（含自定义题库与在线题库）；AI没答上也不回退" }] }, { name: "chapter", label: "章节配置", config: [{ name: "autoAnswer", label: "自动答题", type: "switch", value: defaultConfig$1.autoAnswer, desc: "开启后，会自动答题" }, { name: "autoVideo", label: "自动视频", type: "switch", value: defaultConfig$1.autoVideo, desc: "开启后，会自动观看视频" }, { name: "autoJump", label: "自动切换", type: "switch", value: defaultConfig$1.autoVideo, desc: "开启后，会自动切换章节" }, { name: "redoFinished", label: "重做已完成任务点", type: "switch", value: defaultConfig$1.redoFinished, desc: "开启后，即使任务点已被标记完成也重新处理一遍（视频/音频已完成的会立刻跳过，耗时很短；文档会重新滚动）；关闭则严格跳过已完成任务点" }, { name: "autoDiscuss", label: "自动完成讨论", type: "switch", value: defaultConfig$1.autoDiscuss, desc: "开启后，遇到讨论题(insertbbs)会用AI生成简短发言并提交；会参考其他同学的观点，语言跟随题目（英文题用英文）。需先启用AI并填密钥" }, { name: "autoSubmit", label: "自动提交", type: "switch", value: defaultConfig$1.autoSubmit, desc: "开启后，会自动提交答案" }, { name: "minAccuracy", label: "最低正确率", type: "input", value: defaultConfig$1.minAccuracy, desc: "不满足最低正确率则不会自动提交答案" }, { name: "verifyAnswers", label: "题库复核答案", type: "switch", value: defaultConfig$1.verifyAnswers, desc: "开启后，答完全部题目会再用题库交叉检查一遍（章节/作业在最后复核，考试因翻页无法回填改为每题填完立即复核）" }, { name: "verifyAutoFix", label: "复核不一致时自动修正", type: "switch", value: defaultConfig$1.verifyAutoFix, desc: "开启后，当两个及以上题库给出的答案与当前填写不一致时，自动改成题库答案" }] }, { name: "exam", label: "作业/考试配置", config: [{ name: "examEnabled", label: "考试自动答题", type: "switch", value: defaultConfig$1.examEnabled, desc: "开启后，自动识别考试/测验作答页并整卷作答；关闭则完全跳过考试页" }, { name: "autoExam", label: "考试自动切换", type: "switch", value: defaultConfig$1.autoExam, desc: "开启后，答完当前题自动点'下一题'继续；关闭则等你手动切换，切到新题后自动作答" }, { name: "examAutoSubmit", label: "考试自动交卷", type: "switch", value: defaultConfig$1.examAutoSubmit, desc: "开启后，全部题目答完自动走整卷预览并点击交卷；交卷不可撤回，谨慎开启" }] }, { name: "banks", label: "在线题库", config: [{ name: "bankEnabled", label: "启用哪些在线题库", type: "checkbox", value: defaultConfig$1.bankEnabled, options: [{ label: "题库海", value: "tkh" }, { label: "一之题库", value: "yzt" }, { label: "言溪题库", value: "yx" }, { label: "muketool", value: "mkt" }, { label: "LIKE知识库(datam.site)", value: "datam" }, { label: "ZE题库(zerror)", value: "ze" }], desc: "勾选后参与答题查询与答案复核；取消勾选即完全不请求该题库。LIKE知识库与ZE题库需在下方填各自密钥" }, { name: "zetoken", label: "ZE题库密钥", type: "input", value: defaultConfig$1.zetoken, desc: "ZError 在线题库的 API Token（在 tiku.zerror.cc 的 我的→题库配置 获取）" }, { name: "datamModel", label: "LIKE题库模型", type: "select", value: defaultConfig$1.datamModel, options: [{ label: "deepseek-v3.2", value: "deepseek-v3.2" }, { label: "deepseek-v3.1", value: "deepseek-v3.1" }, { label: "deepseek-v3", value: "deepseek-v3" }, { label: "glm-4.5", value: "glm-4.5" }, { label: "glm-4.5-air", value: "glm-4.5-air" }, { label: "gemini-2.5-pro", value: "gemini-2.5-pro" }, { label: "gemini-2.5-flash", value: "gemini-2.5-flash" }, { label: "gpt-5", value: "gpt-5" }, { label: "qwen-max", value: "qwen-max" }, { label: "qwen-plus", value: "qwen-plus" }, { label: "qwen-turbo", value: "qwen-turbo" }], desc: "LIKE知识库答题所用模型，可下拉选择或手动输入" }, { name: "likeSearch", label: "LIKE题库·联网搜索", type: "switch", value: defaultConfig$1.likeSearch, desc: "仅对 LIKE知识库(datam.site) 生效；开启后服务端联网检索再作答，更准但更慢、更耗点数" }] }], useformStore = pinia$1.defineStore({ id: "formstore", state: () => ({ forminput: getConfig(), dialogV: false, activeName: "base" }), actions: { saveConfig(forminput) {
     _GM_setValue("config", forminput);
-  }, applyModelPresets(url) {
-    const key = String(url || "").trim().replace(/\/$/, "");
-    const presets = modelPresets[key] || [];
-    modelOptionsRef.value = presets.map(function(id) {
-      return { label: id, value: id };
-    });
-  }, fetchModels() {
-    return new Promise((resolve) => {
-      const cfg = this.forminput;
-      const base = (cfg.aiApiUrl || "").trim();
-      if (!base) {
-        ElementPlus.ElNotification({ title: "提示", message: "请先选择AI服务商或填写API地址，再获取模型列表", type: "warning" });
-        return resolve();
+  }, applyModelPresets() {
+    const model = String(this.forminput.aiModel || "");
+    modelOptionsRef.value = model ? [{ label: model, value: model }] : [];
+  }, async fetchModels() {
+    const cfg = this.forminput;
+    try {
+      const ids = await AIProtocol.fetchModels(cfg);
+      modelOptionsRef.value = ids.map((id) => ({ label: id, value: id }));
+      let extra = "";
+      const modelUrl = new URL(AIProtocol.endpoint(cfg, true));
+      if (/\/api\/v1\/query\/models$/i.test(modelUrl.pathname)) {
+        modelUrl.pathname = "/api/v1/balance";
+        await new Promise((resolve) => {
+          _GM_xmlhttpRequest({ method: "GET", url: modelUrl.toString(), headers: AIProtocol.headers(cfg), timeout: 15e3, onload: (response) => {
+            try {
+              const data = JSON.parse(response.responseText);
+              if (response.status >= 200 && response.status < 300 && data.balance != null) extra = `，剩余点数：${data.balance}`;
+            } catch (error) {
+            }
+            resolve();
+          }, ontimeout: resolve, onerror: resolve });
+        });
       }
-      const root = base.replace(/\/chat\/completions\/?$/i, "").replace(/\/$/, "");
-      // LIKE知识库(datam.site)：模型列表接口是 /api/v1/query/models
-      const isLike = /datam\.site/i.test(root) || /\/api\/v1\/query$/i.test(root);
-      const urls = isLike ? [root.replace(/\/api\/v1\/query.*$/i, "").replace(/\/+$/, "") + "/api/v1/query/models"] : [root + "/models"];
-      isLike || (/\/v1\//i.test(root) && urls.push(root.replace(/\/v1\//i, "/") + "models"));
-      let idx = 0;
-      const tryNext = () => {
-        if (idx >= urls.length) {
-          ElementPlus.ElNotification({ title: "错误", message: "获取模型列表失败，请检查API地址与密钥", type: "error" });
-          return resolve();
-        }
-        const url = urls[idx++];
-        console.log("获取模型列表:", url);
-        _GM_xmlhttpRequest({ method: "GET", url, headers: { "Authorization": "Bearer " + (cfg.aiApiKey || "") }, timeout: 2e4, onload: (res) => {
-          try {
-            const data = JSON.parse(res.responseText);
-            const list = (data.data || data.models || []).map(function(m) {
-              return m.id || m.name;
-            }).filter(function(id) {
-              return id;
-            }).map(function(id) {
-              return { label: id, value: id };
-            });
-            if (list.length > 0) {
-              modelOptionsRef.value = list;
-              // LIKE知识库：顺带查一次剩余点数
-              if (isLike) {
-                const balUrl = base.replace(/\/api\/v1\/query.*$/i, "").replace(/\/+$/, "") + "/api/v1/balance";
-                _GM_xmlhttpRequest({ method: "GET", url: balUrl, headers: { "Authorization": "Bearer " + (cfg.aiApiKey || "") }, timeout: 15e3, onload: (br) => {
-                  let extra = "";
-                  try {
-                    const bd = JSON.parse(br.responseText);
-                    bd && bd.balance != null && (extra = `，剩余点数：${bd.balance}`);
-                    console.log("LIKE知识库余额:", bd);
-                  } catch (e) {
-                  }
-                  ElementPlus.ElNotification({ title: "Success", message: `已获取 ${list.length} 个模型，请在"AI模型名称"下拉框选择${extra}`, type: "success" });
-                  resolve();
-                }, ontimeout: () => {
-                  ElementPlus.ElNotification({ title: "Success", message: `已获取 ${list.length} 个模型，请在"AI模型名称"下拉框选择`, type: "success" });
-                  resolve();
-                }, onerror: () => {
-                  ElementPlus.ElNotification({ title: "Success", message: `已获取 ${list.length} 个模型，请在"AI模型名称"下拉框选择`, type: "success" });
-                  resolve();
-                } });
-                return;
-              }
-              ElementPlus.ElNotification({ title: "Success", message: `已获取 ${list.length} 个模型，请在"AI模型名称"下拉框选择`, type: "success" });
-              resolve();
-            } else
-              idx < urls.length ? tryNext() : (ElementPlus.ElNotification({ title: "提示", message: "接口未返回模型列表: " + String(res.responseText).slice(0, 120), type: "warning" }), resolve());
-          } catch (e) {
-            idx < urls.length ? tryNext() : (ElementPlus.ElNotification({ title: "错误", message: "模型列表解析失败: " + String(res.responseText).slice(0, 120), type: "error" }), resolve());
-          }
-        }, ontimeout: () => {
-          idx < urls.length ? tryNext() : (ElementPlus.ElNotification({ title: "错误", message: "获取模型列表超时", type: "error" }), resolve());
-        }, onerror: (err) => {
-          idx < urls.length ? tryNext() : (ElementPlus.ElNotification({ title: "错误", message: "获取模型列表网络错误: " + (err && err.error || "未知"), type: "error" }), resolve());
-        } });
-      };
-      tryNext();
-    });
+      ElementPlus.ElNotification({ title: "Success", message: `已获取 ${ids.length} 个模型，请选择或手动输入模型名称${extra}`, type: "success" });
+    } catch (error) {
+      ElementPlus.ElNotification({ title: "错误", message: error.message, type: "error" });
+    }
   } } });
   var export_helper_default = (sfc, props) => {
     let target = sfc.__vccOpts || sfc;
@@ -186,7 +192,7 @@
   }, _hoisted_1$1 = { class: "dialog-footer" };
   const App = _export_sfc(_sfc_main$1, [["render", function(_ctx, _cache, $props, $setup, $data, $options) {
     const _component_el_button = vue.resolveComponent("el-button"), _component_el_switch = vue.resolveComponent("el-switch"), _component_el_input = vue.resolveComponent("el-input"), _component_el_input_number = vue.resolveComponent("el-input-number"), _component_el_option = vue.resolveComponent("el-option"), _component_el_select = vue.resolveComponent("el-select"), _component_el_checkbox = vue.resolveComponent("el-checkbox"), _component_el_checkbox_group = vue.resolveComponent("el-checkbox-group"), _component_el_tooltip = vue.resolveComponent("el-tooltip"), _component_el_form_item = vue.resolveComponent("el-form-item"), _component_el_tab_pane = vue.resolveComponent("el-tab-pane"), _component_el_tabs = vue.resolveComponent("el-tabs"), _component_el_form = vue.resolveComponent("el-form"), _component_el_dialog = vue.resolveComponent("el-dialog");
-    return vue.openBlock(), vue.createElementBlock(vue.Fragment, null, [vue.createVNode(_component_el_button, { type: "danger", id: "csbutton", icon: _ctx.Setting, circle: "", onClick: _cache[0] || (_cache[0] = ($event) => _ctx.dialogV = !_ctx.dialogV) }, null, 8, ["icon"]), vue.createVNode(_component_el_dialog, { modelValue: _ctx.dialogV, "onUpdate:modelValue": _cache[4] || (_cache[4] = ($event) => _ctx.dialogV = $event), title: "💯超星学习通满分助手", width: "30%", modal: false, center: "", draggable: "" }, { footer: vue.withCtx(() => [vue.createElementVNode("span", _hoisted_1$1, [vue.createVNode(_component_el_button, { onClick: _cache[2] || (_cache[2] = ($event) => _ctx.dialogV = false) }, { default: vue.withCtx(() => [vue.createTextVNode("取消")]), _: 1 }), vue.createVNode(_component_el_button, { onClick: _cache[9] || (_cache[9] = ($event) => _ctx.fetchModels()) }, { default: vue.withCtx(() => [vue.createTextVNode("获取模型列表")]), _: 1 }), vue.createVNode(_component_el_button, { type: "primary", onClick: _cache[3] || (_cache[3] = ($event) => _ctx.submitForm(_ctx.ruleFormRef)) }, { default: vue.withCtx(() => [vue.createTextVNode("保存")]), _: 1 })])]), default: vue.withCtx(() => [vue.createVNode(_component_el_form, { ref: "ruleFormRef", rules: _ctx.rules, model: _ctx.forminput, class: "demo-ruleForm" }, { default: vue.withCtx(() => [vue.createVNode(_component_el_tabs, { class: "demo-tabs", modelValue: _ctx.activeName, "onUpdate:modelValue": _cache[1] || (_cache[1] = ($event) => _ctx.activeName = $event) }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(_ctx.userConfig, (item) => (vue.openBlock(), vue.createBlock(_component_el_tab_pane, { key: item.name, label: item.label, name: item.name }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(item.config, (item1) => (vue.openBlock(), vue.createBlock(_component_el_form_item, { label: item1.label, prop: item1.name }, { default: vue.withCtx(() => [vue.createVNode(_component_el_tooltip, { class: "box-item", effect: "dark", content: item1.desc || "", placement: "top" }, { default: vue.withCtx(() => ["switch" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_switch, { key: 0, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event }, null, 8, ["modelValue", "onUpdate:modelValue"])) : "input" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_input, { key: 1, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event }, null, 8, ["modelValue", "onUpdate:modelValue"])) : "number" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_input_number, { key: 2, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event }, null, 8, ["modelValue", "onUpdate:modelValue"])) : "select" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_select, { key: 3, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event, placeholder: "请选择", filterable: true, allowCreate: true, defaultFirstOption: true, clearable: true }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(item1.options, (item2) => (vue.openBlock(), vue.createBlock(_component_el_option, { key: item2.value, label: item2.label, value: item2.value }, null, 8, ["label", "value"]))), 128))]), _: 2 }, 1032, ["modelValue", "onUpdate:modelValue"])) : "checkbox" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_checkbox_group, { key: 4, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(item1.options, (item2) => (vue.openBlock(), vue.createBlock(_component_el_checkbox, { key: item2.value, label: item2.value, name: item2.value }, { default: vue.withCtx(() => [vue.createTextVNode(vue.toDisplayString(item2.label), 1)]), _: 2 }, 1032, ["label", "name"]))), 128))]), _: 2 }, 1032, ["modelValue", "onUpdate:modelValue"])) : vue.createCommentVNode("", true)]), _: 2 }, 1032, ["content"])]), _: 2 }, 1032, ["label", "prop"]))), 256))]), _: 2 }, 1032, ["label", "name"]))), 128))]), _: 1 }, 8, ["modelValue"])]), _: 1 }, 8, ["rules", "model"])]), _: 1 }, 8, ["modelValue"])], 64);
+    return vue.openBlock(), vue.createElementBlock(vue.Fragment, null, [vue.createVNode(_component_el_button, { type: "danger", id: "csbutton", icon: _ctx.Setting, circle: "", onClick: _cache[0] || (_cache[0] = ($event) => _ctx.dialogV = !_ctx.dialogV) }, null, 8, ["icon"]), vue.createVNode(_component_el_dialog, { class: "mf-script-dialog mf-settings-dialog", modelValue: _ctx.dialogV, "onUpdate:modelValue": _cache[4] || (_cache[4] = ($event) => _ctx.dialogV = $event), title: "💯超星学习通满分助手", width: "680px", modal: false, center: "", draggable: "" }, { footer: vue.withCtx(() => [vue.createElementVNode("span", _hoisted_1$1, [vue.createVNode(_component_el_button, { onClick: _cache[2] || (_cache[2] = ($event) => _ctx.dialogV = false) }, { default: vue.withCtx(() => [vue.createTextVNode("取消")]), _: 1 }), vue.createVNode(_component_el_button, { onClick: _cache[9] || (_cache[9] = ($event) => _ctx.fetchModels()) }, { default: vue.withCtx(() => [vue.createTextVNode("获取模型列表")]), _: 1 }), vue.createVNode(_component_el_button, { type: "primary", onClick: _cache[3] || (_cache[3] = ($event) => _ctx.submitForm(_ctx.ruleFormRef)) }, { default: vue.withCtx(() => [vue.createTextVNode("保存")]), _: 1 })])]), default: vue.withCtx(() => [vue.createVNode(_component_el_form, { ref: "ruleFormRef", rules: _ctx.rules, model: _ctx.forminput, class: "demo-ruleForm" }, { default: vue.withCtx(() => [vue.createVNode(_component_el_tabs, { class: "demo-tabs", modelValue: _ctx.activeName, "onUpdate:modelValue": _cache[1] || (_cache[1] = ($event) => _ctx.activeName = $event) }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(_ctx.userConfig, (item) => (vue.openBlock(), vue.createBlock(_component_el_tab_pane, { key: item.name, label: item.label, name: item.name }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(item.config, (item1) => (vue.openBlock(), vue.createBlock(_component_el_form_item, { label: item1.label, prop: item1.name }, { default: vue.withCtx(() => [vue.createVNode(_component_el_tooltip, { class: "box-item", effect: "dark", content: item1.desc || "", placement: "top" }, { default: vue.withCtx(() => ["switch" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_switch, { key: 0, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event }, null, 8, ["modelValue", "onUpdate:modelValue"])) : "input" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_input, { key: 1, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event }, null, 8, ["modelValue", "onUpdate:modelValue"])) : "number" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_input_number, { key: 2, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event }, null, 8, ["modelValue", "onUpdate:modelValue"])) : "select" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_select, { key: 3, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event, placeholder: "请选择", filterable: true, allowCreate: true, defaultFirstOption: true, clearable: true }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(item1.options, (item2) => (vue.openBlock(), vue.createBlock(_component_el_option, { key: item2.value, label: item2.label, value: item2.value }, null, 8, ["label", "value"]))), 128))]), _: 2 }, 1032, ["modelValue", "onUpdate:modelValue"])) : "checkbox" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_checkbox_group, { key: 4, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(item1.options, (item2) => (vue.openBlock(), vue.createBlock(_component_el_checkbox, { key: item2.value, label: item2.value, name: item2.value }, { default: vue.withCtx(() => [vue.createTextVNode(vue.toDisplayString(item2.label), 1)]), _: 2 }, 1032, ["label", "name"]))), 128))]), _: 2 }, 1032, ["modelValue", "onUpdate:modelValue"])) : vue.createCommentVNode("", true)]), _: 2 }, 1032, ["content"])]), _: 2 }, 1032, ["label", "prop"]))), 256))]), _: 2 }, 1032, ["label", "name"]))), 128))]), _: 1 }, 8, ["modelValue"])]), _: 1 }, 8, ["rules", "model"])]), _: 1 }, 8, ["modelValue"])], 64);
   }], ["__scopeId", "data-v-6ed29f7f"]]);
   let defaultConfig = getConfig();
   // ===== 接口日志（可视化）=====
@@ -200,9 +206,28 @@
       shared = null;
     }
     if (shared) return shared;
+    const history = _GM_getValue("aiAnswerHistory", []);
     const self = {
-    items: [],
+    items: Array.isArray(history) ? history : [],
     listeners: [],
+    recordAI(item) {
+      item.id || (item.id = String(item.t) + "-" + Math.random().toString(36).slice(2));
+      const record = {};
+      for (const key of ["id", "t", "t2", "provider", "kind", "method", "state", "ms", "status", "hit", "note", "preview", "question", "rawResponse", "aiContent", "parsedAnswer"]) {
+        if (item[key] !== undefined) record[key] = item[key];
+      }
+      const stored = _GM_getValue("aiAnswerHistory", []);
+      const records = new Map((Array.isArray(stored) ? stored : []).map((entry) => [entry.id, entry]));
+      records.set(record.id, record);
+      const recent = Array.from(records.values()).sort((a, b) => a.t - b.t).slice(-100);
+      while (recent.length > 1 && JSON.stringify(recent).length > 2e6) recent.shift();
+      try {
+        _GM_setValue("aiAnswerHistory", recent);
+      } catch (error) {
+        console.warn("AI答案日志保存失败，当前页面仍可查看:", error);
+      }
+      this.emit();
+    },
     max: 300,
     push(item) {
       this.items.push(item);
@@ -226,6 +251,7 @@
     },
     clear() {
       this.items.length = 0;
+      _GM_setValue("aiAnswerHistory", []);
       this.emit();
     },
     emit() {
@@ -261,6 +287,22 @@
       _unsafeWindow.__mfAPILog = self;
     } catch (e) {
     }
+    if (typeof GM_addValueChangeListener === "function") {
+      GM_addValueChangeListener("aiAnswerHistory", (key, oldValue, value, remote) => {
+        if (!remote || !Array.isArray(value)) return;
+        if (!value.length) {
+          self.items.length = 0;
+        } else {
+          for (const entry of value) {
+            const existing = self.items.find((item) => item.id === entry.id);
+            existing ? Object.assign(existing, entry) : self.items.push(entry);
+          }
+          self.items.sort((a, b) => a.t - b.t);
+          self.items.splice(0, Math.max(0, self.items.length - self.max));
+        }
+        self.emit();
+      });
+    }
     return self;
   })();
   // ===== 暂停控制（跨 frame 共享：按钮在顶层，答题循环可能在子 iframe）=====
@@ -273,12 +315,14 @@
     }
     if (shared) return shared;
     const self = {
-      paused: false,
+      get paused() {
+        return !!_GM_getValue("answerPaused", false);
+      },
       listeners: [],
       set(v) {
         const next = !!v;
         if (next === this.paused) return;
-        this.paused = next;
+        _GM_setValue("answerPaused", next);
         console.log(next ? "⏸ 已暂停自动答题" : "▶ 已继续自动答题");
         for (let i = 0; i < this.listeners.length; i++) {
           try {
@@ -310,6 +354,11 @@
     try {
       window.top && (window.top.__mfPause = self);
     } catch (e) {
+    }
+    if (typeof GM_addValueChangeListener === "function") {
+      GM_addValueChangeListener("answerPaused", (key, oldValue, value, remote) => {
+        if (remote) self.listeners.forEach((listener) => listener(!!value));
+      });
     }
     return self;
   })();
@@ -780,17 +829,22 @@
     async getAnswerFromAI(questionData) {
       return new Promise((resolve) => {
         let aiItem = null;
+        let settled = false;
         const aiDone = (obj) => {
+          if (settled) return;
+          settled = true;
           if (aiItem) {
+            aiItem.parsedAnswer = obj && obj.answer || "";
             aiItem.ms = aiItem.ms || Date.now() - reqStart;
             aiItem.hit = !!(obj && (Array.isArray(obj.answer) ? obj.answer.length > 0 : String(obj.answer || "").length > 0));
             aiItem.state === "pending" && (aiItem.state = "ok");
             APILog.setPreview(aiItem, aiItem.preview && aiItem.preview.length > 60 ? aiItem.preview : (aiItem.preview || "") + " ⇒ " + (Array.isArray(obj && obj.answer) ? obj.answer.join(" # ") : String((obj && obj.answer) || (obj && obj.raw) || "")));
+            APILog.recordAI(aiItem);
             APILog.done(aiItem);
           }
           resolve(obj);
         };
-        var reqStart = 0;
+        let reqStart = 0;
         const config = getConfig();
         if (!config.aiEnabled || !config.aiApiKey) {
           aiDone({ form: "AI", answer: "" });
@@ -863,36 +917,34 @@
 题目：${questionData.question}
 选项：${optionsText}`;
         }
-        const requestData = {
-          model: config.aiModel || "deepseek-reasoner",
-          messages: [{ role: "user", content: prompt }]
-        };
-        var reqStart = Date.now();
+        let request;
+        try {
+          request = AIProtocol.request(config, prompt);
+        } catch (error) {
+          aiDone({ form: "AI", answer: "", raw: error.message });
+          return;
+        }
+        reqStart = Date.now();
         console.log("AI请求发送中...", "模型:", config.aiModel, "题目类型:", questionTypeId === "3" ? "判断题" : questionTypeId === "1" ? "多选题" : "单选题");
-        APILog.push({ t: reqStart, provider: "AI", kind: "ai", url: config.aiApiUrl, method: "POST", state: "pending", ms: 0, status: 0, hit: false, note: "model=" + (config.aiModel || "") });
-        aiItem = APILog.items[APILog.items.length - 1];
+        aiItem = APILog.push({ t: reqStart, provider: "AI", kind: "ai", url: request.url, method: "POST", state: "pending", ms: 0, status: 0, hit: false, note: "model=" + config.aiModel + " protocol=" + AIProtocol.type(config), question: questionData.question, requestPrompt: prompt, rawResponse: "", aiContent: "", parsedAnswer: "" });
         APILog.setPreview(aiItem, prompt.replace(/\s+/g, " ").slice(0, 200));
         _GM_xmlhttpRequest({
-          method: "POST",
-          url: config.aiApiUrl,
-          data: JSON.stringify(requestData),
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + config.aiApiKey
-          },
-          timeout: 9e4,
-          onload: async (res) => {
+          ...request,
+          onload: (res) => {
+            aiItem.rawResponse = String(res.responseText || "");
             aiItem.ms = Date.now() - reqStart;
             aiItem.status = res.status;
-            aiItem.state = res.status >= 200 && res.status < 400 ? "ok" : "error";
+            aiItem.state = res.status >= 200 && res.status < 300 ? "ok" : "error";
             try {
               console.log("AI返回结果:", res.responseText);
               const data = JSON.parse(res.responseText);
               if (data.usage) {
-                aiItem.note = "tools in/out: " + (data.usage.prompt_tokens || 0) + "/" + (data.usage.completion_tokens || 0);
+                aiItem.note += " · tokens in/out: " + (data.usage.prompt_tokens ?? data.usage.input_tokens ?? 0) + "/" + (data.usage.completion_tokens ?? data.usage.output_tokens ?? 0);
               }
-              if (data.choices && data.choices[0] && data.choices[0].message && (data.choices[0].message.content || data.choices[0].message.reasoning_content)) {
-                const content = (data.choices[0].message.content || data.choices[0].message.reasoning_content || "").trim();
+              aiItem.aiContent = AIProtocol.text(data, config);
+              APILog.emit();
+              if (res.status >= 200 && res.status < 300 && aiItem.aiContent.trim()) {
+                const content = aiItem.aiContent.trim();
                 const typeNames = { "0": "单选题", "1": "多选题", "2": "填空题", "3": "判断题", "4": "简答题", "5": "名词解释", "6": "论述题", "7": "计算题" };
                 const typeName = typeNames[questionTypeId] || "单选题";
                 if (questionTypeId === "3") {
@@ -961,29 +1013,25 @@
                   }
                 }
               } else {
+                aiItem.state = "error";
                 console.log("AI返回格式异常:", data);
                 const errText = String(res.responseText || "");
-                if (!questionData.__modelAutoFixed && /model_not_found|does not exist|model not exists|模型不存在|无可用渠道|invalid model|model_not_available/i.test(errText)) {
-                  questionData.__modelAutoFixed = true;
-                  const fixed = await this.autoFixModel(config.aiModel);
-                  if (fixed && fixed !== config.aiModel) {
-                    ElementPlus.ElNotification({ title: "已自动切换模型", message: `模型 ${config.aiModel} 不可用，已切换为 ${fixed} 并重试本题`, type: "warning" });
-                    return resolve(await this.getAnswerFromAI(questionData));
-                  }
-                }
-                const hint = /model_not_found|does not exist|model not exists|模型不存在/i.test(errText) ? "（模型不存在：点底部'获取模型列表'拉取可用模型；注意模型名区分大小写，如 glm-5.3 全小写）" : "";
+                const hint = /model_not_found|does not exist|model not exists|模型不存在/i.test(errText) ? "（请获取模型列表或手动检查模型名称，模型名区分大小写）" : "";
                 aiDone({ form: "AI", answer: "", raw: "接口返回格式异常: " + errText.slice(0, 200) + hint });
               }
             } catch (e) {
+              aiItem.state = "error";
               console.log("AI解析错误:", e);
               aiDone({ form: "AI", answer: "", raw: "响应解析失败(多为API地址/密钥/模型名错误): " + String(res.responseText).slice(0, 200) });
             }
           },
           ontimeout: () => {
+            aiItem.state = "error";
             console.log("AI请求超时");
             aiDone({ form: "AI", answer: "", raw: "AI请求超时(90秒)：模型太慢或网络不通，可换更快的模型" });
           },
           onerror: (err) => {
+            aiItem.state = "error";
             console.log("AI请求错误:", err);
             aiDone({ form: "AI", answer: "", raw: "AI网络错误: " + (err && err.error || "未知") + "，检查API地址/密钥" });
           }
@@ -991,72 +1039,12 @@
       });
     }
     async fetchModelIds() {
-      const config = getConfig();
-      const base = (config.aiApiUrl || "").trim();
-      if (!base)
+      try {
+        return await AIProtocol.fetchModels(getConfig());
+      } catch (error) {
+        console.log("模型列表拉取失败:", error);
         return null;
-      const root = base.replace(/\/chat\/completions\/?$/i, "").replace(/\/$/, "");
-      // LIKE知识库(datam.site)：模型列表接口是 /api/v1/query/models
-      const isLike = /datam\.site/i.test(root) || /\/api\/v1\/query$/i.test(root);
-      const urls = isLike ? [root.replace(/\/api\/v1\/query.*$/i, "").replace(/\/+$/, "") + "/api/v1/query/models"] : [root + "/models"];
-      isLike || (/\/v1\//i.test(root) && urls.push(root.replace(/\/v1\//i, "/") + "models"));
-      for (let i = 0; i < urls.length; i++) {
-        const url = urls[i];
-        try {
-          const res = await new Promise((resolve, reject) => {
-            _GM_xmlhttpRequest({ method: "GET", url, headers: { "Authorization": "Bearer " + (config.aiApiKey || "") }, timeout: 2e4, onload: (r) => resolve(r), ontimeout: () => reject("timeout"), onerror: (e) => reject(e) });
-          });
-          const data = JSON.parse(res.responseText);
-          const ids = (data.data || data.models || []).map(function(m) {
-            return m.id || m.name;
-          }).filter(function(id) {
-            return id;
-          });
-          if (ids.length > 0) {
-            console.log("拉取到模型列表:", ids);
-            return ids;
-          }
-        } catch (e) {
-          console.log("模型列表拉取失败:", url, e);
-        }
       }
-      return null;
-    }
-    async autoFixModel(badModel) {
-      const config = getConfig();
-      const key = String(config.aiApiUrl || "").trim().replace(/\/$/, "");
-      const bad = String(badModel || "").trim();
-      const presetHit = (modelPresets[key] || []).find(function(id) {
-        return String(id).toLowerCase() === bad.toLowerCase();
-      });
-      if (presetHit && presetHit !== bad) {
-        config.aiModel = presetHit, _GM_setValue("config", config);
-        console.log(`模型名大小写纠正: ${bad} -> ${presetHit}`);
-        return presetHit;
-      }
-      const ids = await this.fetchModelIds();
-      if (ids && ids.length > 0) {
-        modelOptionsRef.value = ids.map(function(id) {
-          return { label: id, value: id };
-        });
-        let hit = ids.find(function(id) {
-          return String(id).toLowerCase() === bad.toLowerCase();
-        });
-        if (!hit) {
-          const prefix = bad.replace(/[0-9._\-（(].*$/i, "").toLowerCase();
-          hit = prefix && ids.find(function(id) {
-            return String(id).toLowerCase().startsWith(prefix);
-          }) || ids.find(function(id) {
-            return /chat|flash|plus|pro|max|turbo|standard/i.test(String(id));
-          }) || ids[0];
-        }
-        if (hit && hit !== bad) {
-          config.aiModel = hit, _GM_setValue("config", config);
-          console.log(`模型自动切换: ${bad} -> ${hit}`);
-          return hit;
-        }
-      }
-      return null;
     }
     async getAnswerForDiscussion(topic, replies, extra = {}) {
       const config = getConfig();
@@ -1121,21 +1109,46 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
       };
 
       const ask = async (prompt, tag) => {
-        const r = await this.req({ provider: "AI-讨论" + (tag || ""), kind: "ai" }, {
-          url: config.aiApiUrl,
-          method: "POST",
-          data: JSON.stringify({ model: config.aiModel || "deepseek-chat", messages: [{ role: "user", content: prompt }] }),
-          headers: { "Content-Type": "application/json", "Authorization": "Bearer " + config.aiApiKey },
-          timeout: 9e4
-        });
-        if (!r.ok) {
-          APILog.setPreview(r.__item, "讨论生成失败: " + (r.note || ("HTTP " + r.status)));
+        let request;
+        try {
+          request = AIProtocol.request(config, prompt);
+        } catch (error) {
+          console.log("讨论AI配置错误:", error.message);
           return "";
         }
-        const data = r.data || {};
-        const content = data && data.choices && data.choices[0] && data.choices[0].message && (data.choices[0].message.content || data.choices[0].message.reasoning_content) || "";
-        const text = String(content).trim().replace(/^["“']|["”']$/g, "").replace(/\s+\n/g, "\n").trim();
-        APILog.setPreview(r.__item, text.slice(0, 200));
+        const r = await this.req({ provider: "AI-讨论" + (tag || ""), kind: "ai" }, request);
+        const item = r.__item;
+        item.question = rawTopic;
+        item.requestPrompt = prompt;
+        item.rawResponse = String(r.text || "");
+        item.aiContent = "";
+        item.parsedAnswer = "";
+        if (!r.ok || !r.jsonOk || r.status >= 300) {
+          item.state = "error";
+          APILog.setPreview(item, "讨论生成失败: " + (r.note || (!r.jsonOk ? "响应非JSON" : "HTTP " + r.status)));
+          APILog.recordAI(item);
+          APILog.emit();
+          return "";
+        }
+        try {
+          item.aiContent = AIProtocol.text(r.data || {}, config);
+        } catch (error) {
+          item.state = "error";
+          item.note = "讨论响应解析失败: " + error.message;
+          APILog.recordAI(item);
+          APILog.emit();
+          return "";
+        }
+        const text = item.aiContent.trim().replace(/^["“']|["”']$/g, "").replace(/\s+\n/g, "\n").trim();
+        item.parsedAnswer = text;
+        item.hit = !!text;
+        if (!text) {
+          item.state = "error";
+          item.note = "接口未返回可用的讨论正文";
+        }
+        APILog.setPreview(item, text || item.note);
+        APILog.recordAI(item);
+        APILog.emit();
         return text;
       };
 
@@ -2935,7 +2948,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
   } }), _hoisted_1 = { class: "dialog-footer" }, _hoisted_2 = { key: 0 }, _hoisted_3 = { class: "question_div" }, _hoisted_4 = { class: "question_ti" }, _hoisted_5 = { key: 0 }, _hoisted_6 = { key: 1 }, _hoisted_7 = { key: 2 }, _hoisted_8 = ["innerHTML"], _hoisted_9 = { key: 0, style: { "margin-top": "20px" } }, _hoisted_10 = { key: 1 }, _hoisted_11 = { key: 2 }, _hoisted_12 = { height: "100px" }, _hoisted_13 = ["innerHTML"];
   const Ask = _export_sfc(_sfc_main, [["render", function(_ctx, _cache, $props, $setup, $data, $options) {
     const _component_el_button = vue.resolveComponent("el-button"), _component_el_switch = vue.resolveComponent("el-switch"), _component_el_input = vue.resolveComponent("el-input"), _component_el_input_number = vue.resolveComponent("el-input-number"), _component_el_option = vue.resolveComponent("el-option"), _component_el_select = vue.resolveComponent("el-select"), _component_el_checkbox = vue.resolveComponent("el-checkbox"), _component_el_checkbox_group = vue.resolveComponent("el-checkbox-group"), _component_el_tooltip = vue.resolveComponent("el-tooltip"), _component_el_form_item = vue.resolveComponent("el-form-item"), _component_el_tab_pane = vue.resolveComponent("el-tab-pane"), _component_el_tabs = vue.resolveComponent("el-tabs"), _component_el_form = vue.resolveComponent("el-form"), _component_el_dialog = vue.resolveComponent("el-dialog"), _component_el_text = vue.resolveComponent("el-text"), _component_el_skeleton = vue.resolveComponent("el-skeleton"), _component_el_card = vue.resolveComponent("el-card"), _component_el_divider = vue.resolveComponent("el-divider"), _component_el_col = vue.resolveComponent("el-col"), _component_el_row = vue.resolveComponent("el-row"), _component_el_scrollbar = vue.resolveComponent("el-scrollbar"), _component_el_tag = vue.resolveComponent("el-tag"), _component_el_alert = vue.resolveComponent("el-alert"), _component_el_empty = vue.resolveComponent("el-empty");
-    return vue.openBlock(), vue.createElementBlock(vue.Fragment, null, [vue.createVNode(_component_el_button, { type: "danger", id: "csbutton", icon: _ctx.Setting, circle: "", onClick: _cache[0] || (_cache[0] = ($event) => _ctx.dialogV = !_ctx.dialogV) }, null, 8, ["icon"]), vue.createVNode(_component_el_dialog, { modelValue: _ctx.dialogV, "onUpdate:modelValue": _cache[4] || (_cache[4] = ($event) => _ctx.dialogV = $event), title: "💯超星学习通满分助手", width: "30%", modal: false, center: "", draggable: "" }, { footer: vue.withCtx(() => [vue.createElementVNode("span", _hoisted_1, [vue.createVNode(_component_el_button, { onClick: _cache[2] || (_cache[2] = ($event) => _ctx.dialogV = false) }, { default: vue.withCtx(() => [vue.createTextVNode("取消")]), _: 1 }), vue.createVNode(_component_el_button, { onClick: _cache[9] || (_cache[9] = ($event) => _ctx.fetchModels()) }, { default: vue.withCtx(() => [vue.createTextVNode("获取模型列表")]), _: 1 }), vue.createVNode(_component_el_button, { type: "primary", onClick: _cache[3] || (_cache[3] = ($event) => _ctx.submitForm(_ctx.ruleFormRef)) }, { default: vue.withCtx(() => [vue.createTextVNode("保存")]), _: 1 })])]), default: vue.withCtx(() => [vue.createVNode(_component_el_form, { ref: "ruleFormRef", rules: _ctx.rules, model: _ctx.forminput, class: "demo-ruleForm" }, { default: vue.withCtx(() => [vue.createVNode(_component_el_tabs, { class: "demo-tabs", modelValue: _ctx.activeName, "onUpdate:modelValue": _cache[1] || (_cache[1] = ($event) => _ctx.activeName = $event) }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(_ctx.userConfig, (item) => (vue.openBlock(), vue.createBlock(_component_el_tab_pane, { key: item.name, label: item.label, name: item.name }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(item.config, (item1) => (vue.openBlock(), vue.createBlock(_component_el_form_item, { label: item1.label, prop: item1.name }, { default: vue.withCtx(() => [vue.createVNode(_component_el_tooltip, { class: "box-item", effect: "dark", content: item1.desc || "", placement: "top" }, { default: vue.withCtx(() => ["switch" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_switch, { key: 0, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event }, null, 8, ["modelValue", "onUpdate:modelValue"])) : "input" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_input, { key: 1, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event }, null, 8, ["modelValue", "onUpdate:modelValue"])) : "number" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_input_number, { key: 2, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event }, null, 8, ["modelValue", "onUpdate:modelValue"])) : "select" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_select, { key: 3, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event, placeholder: "请选择", filterable: true, allowCreate: true, defaultFirstOption: true, clearable: true }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(item1.options, (item2) => (vue.openBlock(), vue.createBlock(_component_el_option, { key: item2.value, label: item2.label, value: item2.value }, null, 8, ["label", "value"]))), 128))]), _: 2 }, 1032, ["modelValue", "onUpdate:modelValue"])) : "checkbox" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_checkbox_group, { key: 4, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(item1.options, (item2) => (vue.openBlock(), vue.createBlock(_component_el_checkbox, { key: item2.value, label: item2.value, name: item2.value }, { default: vue.withCtx(() => [vue.createTextVNode(vue.toDisplayString(item2.label), 1)]), _: 2 }, 1032, ["label", "name"]))), 128))]), _: 2 }, 1032, ["modelValue", "onUpdate:modelValue"])) : vue.createCommentVNode("", true)]), _: 2 }, 1032, ["content"])]), _: 2 }, 1032, ["label", "prop"]))), 256))]), _: 2 }, 1032, ["label", "name"]))), 128))]), _: 1 }, 8, ["modelValue"])]), _: 1 }, 8, ["rules", "model"])]), _: 1 }, 8, ["modelValue"]), (vue.openBlock(), vue.createBlock(vue.Teleport, { to: "body" }, [vue.createVNode(_component_el_button, { id: "zeokdjg", type: "success", plain: "", round: "", icon: _ctx.Aim, onClick: _cache[5] || (_cache[5] = ($event) => _ctx.dialogVisible = !_ctx.dialogVisible) }, { default: vue.withCtx(() => [vue.createTextVNode(vue.toDisplayString("暂未加载" == _ctx.task.name ? "等待任务加载" : "正在完成:" + _ctx.task.name), 1)]), _: 1 }, 8, ["icon"]), vue.createVNode(_component_el_dialog, { modelValue: _ctx.dialogVisible, "onUpdate:modelValue": _cache[8] || (_cache[8] = ($event) => _ctx.dialogVisible = $event), width: "400px", title: "💯超星学习通满分助手", modal: false, "append-to-body": false, "lock-scroll": false, center: "", draggable: "" }, { default: vue.withCtx(() => [vue.createVNode(_component_el_button, { style: { "margin-bottom": "20px" }, type: "primary", onClick: _cache[6] || (_cache[6] = ($event) => _ctx.dialogV = !_ctx.dialogV), plain: "" }, { default: vue.withCtx(() => [vue.createTextVNode("打开配置")]), _: 1 }), vue.createVNode(_component_el_text, { class: "mx-1", size: "large", type: "danger" }, { default: vue.withCtx(() => [vue.createTextVNode("题库秘钥配置请点击这个按钮")]), _: 1 }), vue.createVNode(_component_el_tabs, { modelValue: _ctx.askActiveName, "onUpdate:modelValue": _cache[7] || (_cache[7] = ($event) => _ctx.askActiveName = $event), class: "demo-tabs" }, { default: vue.withCtx(() => [vue.createVNode(_component_el_tab_pane, { label: "运行框", name: "first" }, { default: vue.withCtx(() => [_ctx.task.work.questionList.length > 0 ? (vue.openBlock(), vue.createElementBlock("div", _hoisted_2, [vue.createElementVNode("div", _hoisted_3, [vue.createVNode(_component_el_card, { shadow: "hover" }, { default: vue.withCtx(() => [vue.createElementVNode("h1", _hoisted_4, [vue.createVNode(_component_el_text, { size: "large", truncated: "" }, { default: vue.withCtx(() => [vue.createTextVNode(vue.toDisplayString(_ctx.task.work.inx + 1 + "." + _ctx.task.work.questionList[_ctx.task.work.inx].question), 1)]), _: 1 })]), _ctx.task.work.questionList[_ctx.task.work.inx].answer ? (vue.openBlock(), vue.createElementBlock("p", _hoisted_6, [vue.createElementVNode("p", null, [vue.createElementVNode("pre", null, vue.toDisplayString(_ctx.task.work.questionList[_ctx.task.work.inx].answer), 1)])])) : (vue.openBlock(), vue.createElementBlock("p", _hoisted_5, [vue.createVNode(_component_el_skeleton, { rows: 3, animated: "" })]))]), _: 1 })]), "考试" != _ctx.task.name ? (vue.openBlock(), vue.createBlock(_component_el_divider, { key: 0 }, { default: vue.withCtx(() => [vue.createTextVNode(" 题号 ")]), _: 1 })) : vue.createCommentVNode("", true), "考试" != _ctx.task.name ? (vue.openBlock(), vue.createBlock(_component_el_scrollbar, { key: 1, height: "100px" }, { default: vue.withCtx(() => [vue.createVNode(_component_el_row, null, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(_ctx.task.work.questionList, (item, index) => (vue.openBlock(), vue.createBlock(_component_el_col, { span: 4, key: index }, { default: vue.withCtx(() => [vue.createVNode(_component_el_button, { type: item.status || "info", plain: "", class: "question_btn", onClick: ($event) => _ctx.handleClick(index) }, { default: vue.withCtx(() => [vue.createTextVNode(vue.toDisplayString(index + 1), 1)]), _: 2 }, 1032, ["type", "onClick"])]), _: 2 }, 1024))), 128))]), _: 1 })]), _: 1 })) : vue.createCommentVNode("", true), _ctx.task.work.questionList[_ctx.task.work.inx].allAnswer ? (vue.openBlock(), vue.createElementBlock("div", _hoisted_7, [vue.createVNode(_component_el_divider, null, { default: vue.withCtx(() => [vue.createTextVNode(" 接口返回 ")]), _: 1 }), vue.createVNode(_component_el_tabs, { "tab-position": "left", style: { height: "200px" }, class: "demo-tabs" }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(_ctx.task.work.questionList[_ctx.task.work.inx].allAnswer, (item, index) => (vue.openBlock(), vue.createBlock(_component_el_tab_pane, { label: item.form }, { default: vue.withCtx(() => [vue.createElementVNode("div", null, [vue.createElementVNode("div", { innerHTML: (item.answer || item.raw || "暂无答案") + "<br><p style = 'color:red;'>如果要填写付费秘钥，在本悬浮窗最上方的打开配置中填入秘钥，切记填写完要刷新页面才会生效</p>" }, null, 8, _hoisted_8), null != item.num ? (vue.openBlock(), vue.createElementBlock("div", _hoisted_9, [vue.createElementVNode("div", null, [vue.createVNode(_component_el_tag, { class: "ml-2", type: "info" }, { default: vue.withCtx(() => [vue.createTextVNode("已用次数:" + vue.toDisplayString(item.usenum), 1)]), _: 2 }, 1024)]), vue.createElementVNode("div", null, [vue.createVNode(_component_el_tag, { class: "ml-2", type: "success" }, { default: vue.withCtx(() => [vue.createTextVNode("剩余次数:" + vue.toDisplayString(item.num), 1)]), _: 2 }, 1024)])])) : vue.createCommentVNode("", true)])]), _: 2 }, 1032, ["label"]))), 256))]), _: 1 })])) : vue.createCommentVNode("", true)])) : _ctx.task.video.status ? (vue.openBlock(), vue.createElementBlock("div", _hoisted_10, [vue.createVNode(_component_el_alert, { title: "倍速有风险，挂科两行泪", type: "error", center: "", "show-icon": "" }), vue.createVNode(_component_el_text, { class: "mx-1", size: "large", type: "danger" }, { default: vue.withCtx(() => [vue.createTextVNode(" 正在完成视频任务 ")]), _: 1 })])) : (vue.openBlock(), vue.createElementBlock("div", _hoisted_11, [vue.createElementVNode("div", _hoisted_12, [vue.createVNode(_component_el_empty, { description: _ctx.task.name }, null, 8, ["description"])])]))]), _: 1 }), vue.createVNode(_component_el_tab_pane, { label: "运行日志", name: "second" }, { default: vue.withCtx(() => [vue.createVNode(_component_el_scrollbar, { height: "200px" }, { default: vue.withCtx(() => [vue.createVNode(_component_el_row, null, { default: vue.withCtx(() => [vue.createVNode(_component_el_col, { span: 24 }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(_ctx.task.log, (item, index) => (vue.openBlock(), vue.createElementBlock("p", { key: index, class: "cx_log" }, [vue.createVNode(_component_el_text, { size: "small", type: "info", class: "mx-1" }, { default: vue.withCtx(() => [vue.createTextVNode(vue.toDisplayString(item.time), 1)]), _: 2 }, 1024), vue.createVNode(_component_el_text, { class: "mx-1", type: "info" == item.type ? "" : item.type }, { default: vue.withCtx(() => [vue.createTextVNode(vue.toDisplayString(" " + item.msg), 1)]), _: 2 }, 1032, ["type"])]))), 128))]), _: 1 })]), _: 1 })]), _: 1 })]), _: 1 }), vue.createVNode(_component_el_tab_pane, { label: "公告", name: "msg" }, { default: vue.withCtx(() => [vue.createVNode(_component_el_card, { shadow: "hover" }, { default: vue.withCtx(() => [vue.createElementVNode("div", { innerHTML: _ctx.msg }, null, 8, _hoisted_13)]), _: 1 })]), _: 1 })]), _: 1 }, 8, ["modelValue"]), vue.createElementVNode("p", null, [_ctx.task.status ? (vue.openBlock(), vue.createBlock(_component_el_tag, { key: 0 }, { default: vue.withCtx(() => [vue.createTextVNode(vue.toDisplayString(_ctx.task.status), 1)]), _: 1 })) : vue.createCommentVNode("", true)])]), _: 1 }, 8, ["modelValue"])]))], 64);
+    return vue.openBlock(), vue.createElementBlock(vue.Fragment, null, [vue.createVNode(_component_el_button, { type: "danger", id: "csbutton", icon: _ctx.Setting, circle: "", onClick: _cache[0] || (_cache[0] = ($event) => _ctx.dialogV = !_ctx.dialogV) }, null, 8, ["icon"]), vue.createVNode(_component_el_dialog, { class: "mf-script-dialog mf-settings-dialog", modelValue: _ctx.dialogV, "onUpdate:modelValue": _cache[4] || (_cache[4] = ($event) => _ctx.dialogV = $event), title: "💯超星学习通满分助手", width: "680px", modal: false, center: "", draggable: "" }, { footer: vue.withCtx(() => [vue.createElementVNode("span", _hoisted_1, [vue.createVNode(_component_el_button, { onClick: _cache[2] || (_cache[2] = ($event) => _ctx.dialogV = false) }, { default: vue.withCtx(() => [vue.createTextVNode("取消")]), _: 1 }), vue.createVNode(_component_el_button, { onClick: _cache[9] || (_cache[9] = ($event) => _ctx.fetchModels()) }, { default: vue.withCtx(() => [vue.createTextVNode("获取模型列表")]), _: 1 }), vue.createVNode(_component_el_button, { type: "primary", onClick: _cache[3] || (_cache[3] = ($event) => _ctx.submitForm(_ctx.ruleFormRef)) }, { default: vue.withCtx(() => [vue.createTextVNode("保存")]), _: 1 })])]), default: vue.withCtx(() => [vue.createVNode(_component_el_form, { ref: "ruleFormRef", rules: _ctx.rules, model: _ctx.forminput, class: "demo-ruleForm" }, { default: vue.withCtx(() => [vue.createVNode(_component_el_tabs, { class: "demo-tabs", modelValue: _ctx.activeName, "onUpdate:modelValue": _cache[1] || (_cache[1] = ($event) => _ctx.activeName = $event) }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(_ctx.userConfig, (item) => (vue.openBlock(), vue.createBlock(_component_el_tab_pane, { key: item.name, label: item.label, name: item.name }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(item.config, (item1) => (vue.openBlock(), vue.createBlock(_component_el_form_item, { label: item1.label, prop: item1.name }, { default: vue.withCtx(() => [vue.createVNode(_component_el_tooltip, { class: "box-item", effect: "dark", content: item1.desc || "", placement: "top" }, { default: vue.withCtx(() => ["switch" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_switch, { key: 0, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event }, null, 8, ["modelValue", "onUpdate:modelValue"])) : "input" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_input, { key: 1, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event }, null, 8, ["modelValue", "onUpdate:modelValue"])) : "number" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_input_number, { key: 2, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event }, null, 8, ["modelValue", "onUpdate:modelValue"])) : "select" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_select, { key: 3, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event, placeholder: "请选择", filterable: true, allowCreate: true, defaultFirstOption: true, clearable: true }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(item1.options, (item2) => (vue.openBlock(), vue.createBlock(_component_el_option, { key: item2.value, label: item2.label, value: item2.value }, null, 8, ["label", "value"]))), 128))]), _: 2 }, 1032, ["modelValue", "onUpdate:modelValue"])) : "checkbox" === item1.type ? (vue.openBlock(), vue.createBlock(_component_el_checkbox_group, { key: 4, modelValue: _ctx.forminput[item1.name], "onUpdate:modelValue": ($event) => _ctx.forminput[item1.name] = $event }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(item1.options, (item2) => (vue.openBlock(), vue.createBlock(_component_el_checkbox, { key: item2.value, label: item2.value, name: item2.value }, { default: vue.withCtx(() => [vue.createTextVNode(vue.toDisplayString(item2.label), 1)]), _: 2 }, 1032, ["label", "name"]))), 128))]), _: 2 }, 1032, ["modelValue", "onUpdate:modelValue"])) : vue.createCommentVNode("", true)]), _: 2 }, 1032, ["content"])]), _: 2 }, 1032, ["label", "prop"]))), 256))]), _: 2 }, 1032, ["label", "name"]))), 128))]), _: 1 }, 8, ["modelValue"])]), _: 1 }, 8, ["rules", "model"])]), _: 1 }, 8, ["modelValue"]), (vue.openBlock(), vue.createBlock(vue.Teleport, { to: "body" }, [vue.createVNode(_component_el_button, { id: "zeokdjg", type: "success", plain: "", round: "", icon: _ctx.Aim, onClick: _cache[5] || (_cache[5] = ($event) => _ctx.dialogVisible = !_ctx.dialogVisible) }, { default: vue.withCtx(() => [vue.createTextVNode(vue.toDisplayString("暂未加载" == _ctx.task.name ? "等待任务加载" : "正在完成:" + _ctx.task.name), 1)]), _: 1 }, 8, ["icon"]), vue.createVNode(_component_el_dialog, { class: "mf-script-dialog mf-task-dialog", modelValue: _ctx.dialogVisible, "onUpdate:modelValue": _cache[8] || (_cache[8] = ($event) => _ctx.dialogVisible = $event), width: "400px", title: "💯超星学习通满分助手", modal: false, "append-to-body": false, "lock-scroll": false, center: "", draggable: "" }, { default: vue.withCtx(() => [vue.createVNode(_component_el_button, { style: { "margin-bottom": "20px" }, type: "primary", onClick: _cache[6] || (_cache[6] = ($event) => _ctx.dialogV = !_ctx.dialogV), plain: "" }, { default: vue.withCtx(() => [vue.createTextVNode("打开配置")]), _: 1 }), vue.createVNode(_component_el_text, { class: "mx-1", size: "large", type: "danger" }, { default: vue.withCtx(() => [vue.createTextVNode("题库秘钥配置请点击这个按钮")]), _: 1 }), vue.createVNode(_component_el_tabs, { modelValue: _ctx.askActiveName, "onUpdate:modelValue": _cache[7] || (_cache[7] = ($event) => _ctx.askActiveName = $event), class: "demo-tabs" }, { default: vue.withCtx(() => [vue.createVNode(_component_el_tab_pane, { label: "运行框", name: "first" }, { default: vue.withCtx(() => [_ctx.task.work.questionList.length > 0 ? (vue.openBlock(), vue.createElementBlock("div", _hoisted_2, [vue.createElementVNode("div", _hoisted_3, [vue.createVNode(_component_el_card, { shadow: "hover" }, { default: vue.withCtx(() => [vue.createElementVNode("h1", _hoisted_4, [vue.createVNode(_component_el_text, { size: "large", truncated: "" }, { default: vue.withCtx(() => [vue.createTextVNode(vue.toDisplayString(_ctx.task.work.inx + 1 + "." + _ctx.task.work.questionList[_ctx.task.work.inx].question), 1)]), _: 1 })]), _ctx.task.work.questionList[_ctx.task.work.inx].answer ? (vue.openBlock(), vue.createElementBlock("p", _hoisted_6, [vue.createElementVNode("p", null, [vue.createElementVNode("pre", null, vue.toDisplayString(_ctx.task.work.questionList[_ctx.task.work.inx].answer), 1)])])) : (vue.openBlock(), vue.createElementBlock("p", _hoisted_5, [vue.createVNode(_component_el_skeleton, { rows: 3, animated: "" })]))]), _: 1 })]), "考试" != _ctx.task.name ? (vue.openBlock(), vue.createBlock(_component_el_divider, { key: 0 }, { default: vue.withCtx(() => [vue.createTextVNode(" 题号 ")]), _: 1 })) : vue.createCommentVNode("", true), "考试" != _ctx.task.name ? (vue.openBlock(), vue.createBlock(_component_el_scrollbar, { key: 1, height: "100px" }, { default: vue.withCtx(() => [vue.createVNode(_component_el_row, null, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(_ctx.task.work.questionList, (item, index) => (vue.openBlock(), vue.createBlock(_component_el_col, { span: 4, key: index }, { default: vue.withCtx(() => [vue.createVNode(_component_el_button, { type: item.status || "info", plain: "", class: "question_btn", onClick: ($event) => _ctx.handleClick(index) }, { default: vue.withCtx(() => [vue.createTextVNode(vue.toDisplayString(index + 1), 1)]), _: 2 }, 1032, ["type", "onClick"])]), _: 2 }, 1024))), 128))]), _: 1 })]), _: 1 })) : vue.createCommentVNode("", true), _ctx.task.work.questionList[_ctx.task.work.inx].allAnswer ? (vue.openBlock(), vue.createElementBlock("div", _hoisted_7, [vue.createVNode(_component_el_divider, null, { default: vue.withCtx(() => [vue.createTextVNode(" 接口返回 ")]), _: 1 }), vue.createVNode(_component_el_tabs, { "tab-position": "left", style: { height: "200px" }, class: "demo-tabs" }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(_ctx.task.work.questionList[_ctx.task.work.inx].allAnswer, (item, index) => (vue.openBlock(), vue.createBlock(_component_el_tab_pane, { label: item.form }, { default: vue.withCtx(() => [vue.createElementVNode("div", null, [vue.createElementVNode("div", { innerHTML: (item.answer || item.raw || "暂无答案") + "<br><p style = 'color:red;'>如果要填写付费秘钥，在本悬浮窗最上方的打开配置中填入秘钥，切记填写完要刷新页面才会生效</p>" }, null, 8, _hoisted_8), null != item.num ? (vue.openBlock(), vue.createElementBlock("div", _hoisted_9, [vue.createElementVNode("div", null, [vue.createVNode(_component_el_tag, { class: "ml-2", type: "info" }, { default: vue.withCtx(() => [vue.createTextVNode("已用次数:" + vue.toDisplayString(item.usenum), 1)]), _: 2 }, 1024)]), vue.createElementVNode("div", null, [vue.createVNode(_component_el_tag, { class: "ml-2", type: "success" }, { default: vue.withCtx(() => [vue.createTextVNode("剩余次数:" + vue.toDisplayString(item.num), 1)]), _: 2 }, 1024)])])) : vue.createCommentVNode("", true)])]), _: 2 }, 1032, ["label"]))), 256))]), _: 1 })])) : vue.createCommentVNode("", true)])) : _ctx.task.video.status ? (vue.openBlock(), vue.createElementBlock("div", _hoisted_10, [vue.createVNode(_component_el_alert, { title: "倍速有风险，挂科两行泪", type: "error", center: "", "show-icon": "" }), vue.createVNode(_component_el_text, { class: "mx-1", size: "large", type: "danger" }, { default: vue.withCtx(() => [vue.createTextVNode(" 正在完成视频任务 ")]), _: 1 })])) : (vue.openBlock(), vue.createElementBlock("div", _hoisted_11, [vue.createElementVNode("div", _hoisted_12, [vue.createVNode(_component_el_empty, { description: _ctx.task.name }, null, 8, ["description"])])]))]), _: 1 }), vue.createVNode(_component_el_tab_pane, { label: "运行日志", name: "second" }, { default: vue.withCtx(() => [vue.createVNode(_component_el_scrollbar, { height: "200px" }, { default: vue.withCtx(() => [vue.createVNode(_component_el_row, null, { default: vue.withCtx(() => [vue.createVNode(_component_el_col, { span: 24 }, { default: vue.withCtx(() => [(vue.openBlock(true), vue.createElementBlock(vue.Fragment, null, vue.renderList(_ctx.task.log, (item, index) => (vue.openBlock(), vue.createElementBlock("p", { key: index, class: "cx_log" }, [vue.createVNode(_component_el_text, { size: "small", type: "info", class: "mx-1" }, { default: vue.withCtx(() => [vue.createTextVNode(vue.toDisplayString(item.time), 1)]), _: 2 }, 1024), vue.createVNode(_component_el_text, { class: "mx-1", type: "info" == item.type ? "" : item.type }, { default: vue.withCtx(() => [vue.createTextVNode(vue.toDisplayString(" " + item.msg), 1)]), _: 2 }, 1032, ["type"])]))), 128))]), _: 1 })]), _: 1 })]), _: 1 })]), _: 1 }), vue.createVNode(_component_el_tab_pane, { label: "公告", name: "msg" }, { default: vue.withCtx(() => [vue.createVNode(_component_el_card, { shadow: "hover" }, { default: vue.withCtx(() => [vue.createElementVNode("div", { innerHTML: _ctx.msg }, null, 8, _hoisted_13)]), _: 1 })]), _: 1 })]), _: 1 }, 8, ["modelValue"]), vue.createElementVNode("p", null, [_ctx.task.status ? (vue.openBlock(), vue.createBlock(_component_el_tag, { key: 0 }, { default: vue.withCtx(() => [vue.createTextVNode(vue.toDisplayString(_ctx.task.status), 1)]), _: 1 })) : vue.createCommentVNode("", true)])]), _: 1 }, 8, ["modelValue"])]))], 64);
   }], ["__scopeId", "data-v-c3c6b09f"]]);
   class Cx {
     constructor() {
@@ -3065,7 +3078,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
         const Timu = iframeWindow.document.querySelectorAll(".TiMu");
         if (!Timu)
           return void resolve();
-        let ques = [], succ = 0;
+        let ques = [], questionNodes = [], succ = 0;
         for (let i = 0; i < Timu.length; i++) {
           let data;
           try {
@@ -3074,7 +3087,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
             console.log(`第${i + 1}题解析失败，已跳过:`, e);
             continue;
           }
-          console.log(data), ques.push(data);
+          console.log(data), ques.push(data), questionNodes.push(Timu[i]);
         }
         if (0 === ques.length) {
           this.askStore.log("未解析到题目，页面结构可能已变化", "error");
@@ -3082,18 +3095,22 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
         }
         this.askStore.reset(), this.askStore.count = ques.length, this.askStore.task.name = "章节测验";
         for (let i = 0; i < ques.length; i++) {
-          await PauseCtl.wait(), PauseCtl.paused && (this.askStore.task.status = "已暂停，点左下角「继续」恢复");
-          await randomSleep(this.defaultConfig.answerIntervalMin, this.defaultConfig.answerIntervalMax), this.askStore.insert(ques[i]), this.askStore.task.work.inx = i;
+          await PauseCtl.wait();
+          await randomSleep(this.defaultConfig.answerIntervalMin, this.defaultConfig.answerIntervalMax);
+          await PauseCtl.wait();
+          this.askStore.insert(ques[i]), this.askStore.task.work.inx = i;
           let data = await getAnswers(ques[i], iframeWindow);
           this.askStore.get(i).allAnswer = data;
-          let tmp = fillAnswer(data, ques[i], Timu[i], iframeWindow);
-          tmp ? (this.askStore.get(i).status = "primary", this.askStore.get(i).answer = tmp, succ++) : (this.askStore.get(i).status = "danger", this.askStore.get(i).answer = "暂无答案"), this.askStore.get(i).dom = Timu[i];
+          await PauseCtl.wait();
+          let tmp = fillAnswer(data, ques[i], questionNodes[i], iframeWindow);
+          tmp ? (this.askStore.get(i).status = "primary", this.askStore.get(i).answer = tmp, succ++) : (this.askStore.get(i).status = "danger", this.askStore.get(i).answer = "暂无答案"), this.askStore.get(i).dom = questionNodes[i];
         }
         // ===== 题库复核环节：用题库交叉检查答案 =====
         if (this.defaultConfig.verifyAnswers && ques.length > 0) {
           this.askStore.log("开始题库复核：交叉检查每道题答案", "info");
           let fixed = 0, checked = 0;
           for (let i = 0; i < ques.length; i++) {
+            await PauseCtl.wait();
             const raw = this.askStore.get(i).answer;
             if (raw == null || "暂无答案" === raw) continue;
             const cur = Array.isArray(raw) ? raw : [raw];
@@ -3114,7 +3131,8 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
               this.askStore.log(`第${i + 1}题复核不一致：当前「${cur.join("、")}」，题库「${bestText}」(${srcList})`, "warning");
               if (this.defaultConfig.verifyAutoFix) {
                 try {
-                  const ok = setAnswer(vr.best.answer, ques[i], Timu[i], iframeWindow);
+                  await PauseCtl.wait();
+                  const ok = setAnswer(vr.best.answer, ques[i], questionNodes[i], iframeWindow);
                   if (ok) {
                     this.askStore.get(i).answer = vr.best.answer;
                     this.askStore.get(i).status = "primary";
@@ -3138,7 +3156,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
         await PauseCtl.wait();
         this.defaultConfig.autoSubmit ? (succ / ques.length < this.defaultConfig.minAccuracy ? (this.askStore.log("章节测验正确率不足，暂存", "error"), iframeWindow.alert = function(e) {
           console.log("alert 方法被阻止", e);
-        }, iframeWindow.noSubmit()) : (await randomSleep(this.defaultConfig.submitDelayMin, this.defaultConfig.submitDelayMax), iframeWindow.btnBlueSubmit(), await sleep(3), iframeWindow.submitCheckTimes(), this.askStore.log("章节测验已完成", "success"), await randomSleep(5, 10), this.askStore.log("正在刷新页面...", "info"), iframeWindow.location.reload()), this.askStore.task.status = `章节测验已完成，等待切换,正确率:${succ}/${ques.length}`, resolve()) : (this.askStore.log("已完成答题，未开启自动提交，等待手动提交中", "success"), this.askStore.task.status = `正在等待手动提交,正确率:${succ}/${ques.length}`);
+        }, iframeWindow.noSubmit()) : (await randomSleep(this.defaultConfig.submitDelayMin, this.defaultConfig.submitDelayMax), await PauseCtl.wait(), iframeWindow.btnBlueSubmit(), await sleep(3), await PauseCtl.wait(), iframeWindow.submitCheckTimes(), this.askStore.log("章节测验已完成", "success"), await randomSleep(5, 10), await PauseCtl.wait(), this.askStore.log("正在刷新页面...", "info"), iframeWindow.location.reload()), this.askStore.task.status = `章节测验已完成，等待切换,正确率:${succ}/${ques.length}`, resolve()) : (this.askStore.log("已完成答题，未开启自动提交，等待手动提交中", "success"), this.askStore.task.status = `正在等待手动提交,正确率:${succ}/${ques.length}`);
       });
     }
     homework() {
@@ -3146,7 +3164,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
         const Timu = _unsafeWindow.document.querySelectorAll(".questionLi");
         if (!Timu)
           return void resolve();
-        let ques = [];
+        let ques = [], questionNodes = [];
         for (let i = 0; i < Timu.length; i++) {
           let data;
           try {
@@ -3156,21 +3174,26 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
             continue;
           }
           ques.push(data);
+          questionNodes.push(Timu[i]);
         }
         this.askStore.reset(), this.askStore.count = ques.length, this.askStore.task.name = "作业";
         for (let i = 0; i < ques.length; i++) {
-          await PauseCtl.wait(), PauseCtl.paused && (this.askStore.task.status = "已暂停，点左下角「继续」恢复");
-          await randomSleep(this.defaultConfig.answerIntervalMin, this.defaultConfig.answerIntervalMax), this.askStore.insert(ques[i]), this.askStore.task.work.inx = i;
+          await PauseCtl.wait();
+          await randomSleep(this.defaultConfig.answerIntervalMin, this.defaultConfig.answerIntervalMax);
+          await PauseCtl.wait();
+          this.askStore.insert(ques[i]), this.askStore.task.work.inx = i;
           let data = await getAnswers(ques[i]);
           this.askStore.get(i).allAnswer = data;
-          let tmp = fillAnswer(data, ques[i], Timu[i], _unsafeWindow);
-          tmp ? (this.askStore.get(i).status = "primary", this.askStore.get(i).answer = tmp) : (this.askStore.get(i).status = "danger", this.askStore.get(i).answer = "暂无答案"), this.askStore.get(i).dom = Timu[i];
+          await PauseCtl.wait();
+          let tmp = fillAnswer(data, ques[i], questionNodes[i], _unsafeWindow);
+          tmp ? (this.askStore.get(i).status = "primary", this.askStore.get(i).answer = tmp) : (this.askStore.get(i).status = "danger", this.askStore.get(i).answer = "暂无答案"), this.askStore.get(i).dom = questionNodes[i];
         }
         // ===== 题库复核环节 =====
         if (this.defaultConfig.verifyAnswers && ques.length > 0) {
           this.askStore.log("开始题库复核：交叉检查每道题答案", "info");
           let fixed = 0;
           for (let i = 0; i < ques.length; i++) {
+            await PauseCtl.wait();
             const raw = this.askStore.get(i).answer;
             if (raw == null || "暂无答案" === raw) continue;
             const cur = Array.isArray(raw) ? raw : [raw];
@@ -3190,7 +3213,8 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
               this.askStore.log(`第${i + 1}题复核不一致：当前「${cur.join("、")}」，题库「${bestText}」(${srcList})`, "warning");
               if (this.defaultConfig.verifyAutoFix) {
                 try {
-                  const ok = setAnswer(vr.best.answer, ques[i], Timu[i], _unsafeWindow);
+                  await PauseCtl.wait();
+                  const ok = setAnswer(vr.best.answer, ques[i], questionNodes[i], _unsafeWindow);
                   if (ok) {
                     this.askStore.get(i).answer = vr.best.answer;
                     this.askStore.get(i).status = "primary";
@@ -3209,6 +3233,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
           }
           this.askStore.log(`题库复核完成：修正 ${fixed} 题`, "success");
         }
+        resolve();
       });
     }
     exam() {
@@ -3228,8 +3253,9 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
         let guard = 0, finished = false;
         this.askStore.log("考试模式启动：自动识别并整卷作答", "success");
         while (!finished && guard++ < (cfg.autoExam ? 400 : 3600)) {
-          await PauseCtl.wait(), PauseCtl.paused && (this.askStore.task.status = "已暂停，点左下角「继续」恢复");
+          await PauseCtl.wait();
           await waitElementLoaded(_unsafeWindow, ".mark_name");
+          await PauseCtl.wait();
           let data;
           try {
             data = getQuestion("3", _unsafeWindow.document.body);
@@ -3245,6 +3271,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
             this.askStore.task.status = `正在作答第 ${idx + 1} 题`;
             const answers = await getAnswers(data);
             this.askStore.get(idx).allAnswer = answers;
+            await PauseCtl.wait();
             const tmp = fillAnswer(answers, data, _unsafeWindow.document.getElementsByClassName("mark_table")[0], _unsafeWindow);
             if (tmp) {
               this.askStore.get(idx).status = "primary", this.askStore.get(idx).answer = tmp, this.askStore.log(`第 ${idx + 1} 题已填写`, "success");
@@ -3269,7 +3296,8 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
                   this.askStore.log(`第 ${idx + 1} 题复核不一致：当前「${cur.join("、")}」，题库「${bestText}」(${srcList})`, "warning");
                   if (cfg.verifyAutoFix) {
                     try {
-                      const ok = setAnswer(vr.best.answer, data, _unsafeWindow.document.getElementsByClassName("mark_table")[0], _unsafeWindow);
+                      await PauseCtl.wait();
+                  const ok = setAnswer(vr.best.answer, data, _unsafeWindow.document.getElementsByClassName("mark_table")[0], _unsafeWindow);
                       if (ok) {
                         this.askStore.get(idx).answer = vr.best.answer;
                         this.askStore.log(`第 ${idx + 1} 题已按题库修正为「${bestText}」`, "success");
@@ -3294,6 +3322,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
             continue;
           }
           await randomSleep(cfg.answerIntervalMin, cfg.answerIntervalMax);
+          await PauseCtl.wait();
           const before = getMarkHtml();
           const nextButton = $('.nextDiv .jb_btn:contains("下一题")');
           if (nextButton && nextButton.length > 0) {
@@ -3329,6 +3358,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
     async examSubmit() {
       this.askStore.log("配置已开启考试自动交卷，开始执行交卷流程", "warning");
       await sleep(3);
+      await PauseCtl.wait();
       try {
         const previewBtn = $(".completeBtn");
         if (previewBtn && previewBtn.length > 0)
@@ -3340,6 +3370,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
           return;
         }
         await sleep(3);
+        await PauseCtl.wait();
         const submitBtn = $('a:contains("交卷")').filter(function() {
           return "交卷" === $(this).text().trim();
         });
@@ -3352,6 +3383,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
         }
         for (let t = 0; t < 20; t++) {
           await sleep(0.5);
+          await PauseCtl.wait();
           const confirmBtn = $('.jb_btn:contains("确定"), .btnBlue:contains("确定"), #popok, .layui-layer-btn0, a:contains("确认")');
           if (confirmBtn && confirmBtn.length > 0) {
             this.askStore.log("检测到交卷确认弹窗，点击确定...", "warning");
@@ -3409,6 +3441,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
         // 打开发言框并填入（最多 3 次）
         let filled = "";
         for (let attempt = 0; attempt < 3 && !filled; attempt++) {
+          await PauseCtl.wait();
           filled = this.discussFill(iframeWindow, text);
           if (!filled) {
             const opened = this.discussOpenEditor(iframeWindow);
@@ -3423,6 +3456,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
         this.askStore.log("发言已填入输入框(" + filled + ")", "success");
         await PauseCtl.wait();
         await sleep(1);
+        await PauseCtl.wait();
 
         if (!this.discussSubmit(iframeWindow)) {
           this.askStore.log("未找到提交按钮，内容已填好请手动提交", "error");
@@ -3869,7 +3903,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
             console.log("讨论兜底扫描失败:", e);
           }
         }
-        await sleep(formStore.forminput.interval), !formStore.forminput.autoJump && cxModel.askStore.msg("由于未开启自动切换,请手动切换"), formStore.forminput.autoJump && (top == null ? void 0 : top.document.querySelector(".nextChapter").click());
+        await sleep(formStore.forminput.interval), await PauseCtl.wait(), !formStore.forminput.autoJump && cxModel.askStore.msg("由于未开启自动切换,请手动切换"), formStore.forminput.autoJump && (top == null ? void 0 : top.document.querySelector(".nextChapter").click());
       };
       setInterval(async () => {
         await waitElementLoaded(_self, "#iframe");
@@ -4028,6 +4062,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
         const replies = getReplies();
         if (replies.length) cxm.askStore.log(`参考了 ${replies.length} 条他人回复`, "success");
 
+        await PauseCtl.wait();
         const text = await new ServerApi(window).getAnswerForDiscussion(topic, replies, {
           course: getCourseName(),
           chapter: getCatalogChapter()
@@ -4039,15 +4074,18 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
         cxm.askStore.log("生成回复: " + text.slice(0, 60) + (text.length > 60 ? "…" : ""), "success");
 
         // 打开发言框 → 填入
+        await PauseCtl.wait();
         let filled = fillReply(text);
         if (!filled) {
           openEditor();
           await sleep(1.2);
+          await PauseCtl.wait();
           filled = fillReply(text);
         }
         if (!filled) {
           openEditor();
           await sleep(1.8);
+          await PauseCtl.wait();
           filled = fillReply(text);
         }
         if (!filled) {
@@ -4058,6 +4096,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
         cxm.askStore.log("回复内容已填入", "success");
         await PauseCtl.wait();
         await sleep(1);
+        await PauseCtl.wait();
 
         const before = countReplies();
         if (!submitReply()) {
@@ -4324,9 +4363,9 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
     });
 
     var CSS = [
-        '#mf-apilog{position:fixed;left:10px;bottom:120px;width:430px;max-height:52vh;z-index:2147483646;background:#fff;border:1px solid #dcdfe6;border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,.12);font:12px/1.5 -apple-system,"Microsoft YaHei",sans-serif;color:#303133;display:none;flex-direction:column;overflow:hidden}',
+        '#mf-apilog{position:fixed;left:10px;bottom:120px;width:760px;max-width:calc(100vw - 20px);max-height:calc(100vh - 140px);height:540px;box-sizing:border-box;z-index:2147483646;background:#fff;border:1px solid #dcdfe6;border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,.12);font:12px/1.5 -apple-system,"Microsoft YaHei",sans-serif;color:#303133;display:none;flex-direction:column;overflow:hidden}',
         '#mf-apilog.mf-open{display:flex}',
-        '#mf-apilog .mf-hd{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #ebeef5;background:#fafafa;cursor:default;flex-shrink:0}',
+        '#mf-apilog .mf-hd{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px;border-bottom:1px solid #ebeef5;background:#fafafa;cursor:default;flex-shrink:0}',
         '#mf-apilog .mf-hd b{font-size:13px}',
         '#mf-apilog .mf-hd .mf-sp{flex:1}',
         '#mf-apilog button{border:1px solid #dcdfe6;background:#fff;border-radius:4px;padding:2px 8px;font-size:12px;cursor:pointer;color:#606266}',
@@ -4344,7 +4383,8 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
         '#mf-apilog .mf-tag.ok{background:#e1f3d8;color:#529b2e}',
         '#mf-apilog .mf-tag.err{background:#fde2e2;color:#c45656}',
         '#mf-apilog .mf-tag.wait{background:#fdf6ec;color:#b88230}',
-        '#mf-apilog .mf-pv{color:#909399;display:block;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+        '#mf-apilog .mf-pv{color:#606266;display:block;max-width:350px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+        '#mf-apilog details{min-width:180px}#mf-apilog summary{cursor:pointer;color:#409eff}#mf-apilog .mf-detail{min-width:0;max-width:100%;padding:8px 0}#mf-apilog .mf-detail b{display:block;margin-top:8px}#mf-apilog pre{margin:4px 0;max-height:260px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f7fa;padding:8px;border-radius:4px;font:12px/1.6 monospace}#mf-apilog .mf-body{min-height:0;overscroll-behavior:contain}#mf-apilog table{table-layout:fixed}#mf-apilog td{overflow-wrap:anywhere}',
         '#mf-apilog-btn{position:fixed;left:10px;bottom:88px;z-index:2147483646;border:1px solid #c6e2ff;background:#ecf5ff;color:#409eff;border-radius:16px;padding:5px 12px;font:12px -apple-system,"Microsoft YaHei",sans-serif;cursor:pointer;box-shadow:0 2px 8px rgba(64,158,255,.18)}',
         '#mf-apilog-btn:hover{background:#d9ecff}'
     ].join('\n');
@@ -4358,7 +4398,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
     var panel = doc.createElement('div');
     panel.id = 'mf-apilog';
     panel.innerHTML = '<div class="mf-hd"><b>📡 接口 / AI 请求日志</b><span class="mf-sp"></span>' +
-        '<button data-act="pause">暂停刷新</button><button data-act="clear">清空</button><button data-act="close">收起</button></div>' +
+        '<button data-act="pause" title="仅暂停日志显示，答题任务继续运行">暂停刷新</button><button data-act="export">导出 JSON</button><button data-act="clear">清空</button><button data-act="close">收起</button></div>' +
         '<div class="mf-stat"></div><div class="mf-body"><table><thead><tr>' +
         '<th style="width:58px">时间</th><th style="width:74px">渠道</th><th style="width:44px">耗时</th>' +
         '<th style="width:40px">状态</th><th>内容摘要</th></tr></thead><tbody></tbody></table></div>';
@@ -4368,6 +4408,10 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
     var paused = false;
     var tbody = panel.querySelector('tbody');
     var statBox = panel.querySelector('.mf-stat');
+    var bodyBox = panel.querySelector('.mf-body');
+    var itemIds = new WeakMap();
+    var nextItemId = 0;
+    var rendered = '';
 
     function fmtTime(t) {
         var d = new Date(t);
@@ -4378,20 +4422,65 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
             return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c];
         });
     }
-    function render() {
-        if (paused) return;
-        var items = api.items.slice(-80).reverse();
+    function displayUrl(value) {
+        return String(value || '').replace(/([?&](?:[^=&#]*(?:key|token|secret|password|authorization|credential)[^=&#]*)=)[^&#]*/gi, '$1[REDACTED]');
+    }
+    function exportItem(item) {
+        var out = {};
+        ['t', 'provider', 'kind', 'method', 'state', 'ms', 'status', 'hit', 'question', 'requestPrompt', 'rawResponse', 'aiContent', 'parsedAnswer', 'preview', 'note'].forEach(function (key) {
+            if (item[key] !== undefined) out[key] = item[key];
+        });
+        out.url = displayUrl(item.url);
+        return out;
+    }
+    function valueText(value) {
+        return typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value, null, 2);
+    }
+    function render(force) {
+        if (paused && !force) return;
+        var items = api.items.slice().reverse();
         var html = '';
+        var opened = new Set();
+        var scrolls = [];
+        tbody.querySelectorAll('details[open]').forEach(function (el) { opened.add(el.dataset.item); });
+        tbody.querySelectorAll('pre').forEach(function (el) {
+            if (el.scrollTop || el.scrollLeft) scrolls.push([el.closest('details').dataset.item, el.dataset.field, el.scrollTop, el.scrollLeft]);
+        });
+        var scrollTop = bodyBox.scrollTop;
         for (var i = 0; i < items.length; i++) {
             var it = items[i];
-            var st = it.state === 'ok' ? '<span class="mf-tag ok">200</span>' : it.state === 'pending' ? '<span class="mf-tag wait">···</span>' : '<span class="mf-tag err">' + esc(it.status || 'ERR') + '</span>';
+            if (!itemIds.has(it)) itemIds.set(it, String(++nextItemId));
+            var id = itemIds.get(it);
+            var st = it.state === 'ok' ? '<span class="mf-tag ok">' + esc(it.status || 'OK') + '</span>' : it.state === 'pending' ? '<span class="mf-tag wait">···</span>' : '<span class="mf-tag err">' + esc(it.status || 'ERR') + '</span>';
             var cls = (it.state === 'ok' ? 'mf-ok' : it.state === 'pending' ? '' : 'mf-err') + (it.hit ? ' mf-hit' : '');
+            var fields = [
+                ['完整题目 / 讨论主题', it.question], ['请求提示词', it.requestPrompt],
+                ['AI 完整正文', it.aiContent], ['HTTP 响应原文', it.rawResponse || it.responseText],
+                ['解析答案', it.parsedAnswer == null ? it.answer : it.parsedAnswer],
+                ['请求地址', displayUrl(it.url)], ['备注', it.note]
+            ];
+            var detail = '';
+            fields.forEach(function (field, index) {
+                var text = valueText(field[1]);
+                if (text) detail += '<b>' + field[0] + '</b><pre data-field="' + index + '">' + esc(text) + '</pre>';
+            });
             html += '<tr class="' + cls + '"><td>' + fmtTime(it.t) + '</td><td>' + esc(it.provider) + '</td><td>' + (it.ms || 0) + 'ms</td><td>' + st + '</td>' +
-                '<td>' + (it.hit ? '✅ ' : '') + '<span class="mf-pv" title="' + esc((it.note || '') + ' ' + (it.preview || '')) + '">' + esc(it.preview || it.note || '') + '</span></td></tr>';
+                '<td><span class="mf-pv" title="' + esc(it.question || it.preview || it.note || '') + '">' + esc(it.question || it.preview || it.note || '') + '</span>' +
+                '<details data-item="' + id + '"><summary>查看完整请求与答案</summary><div class="mf-detail">' + (detail || '等待响应…') + '</div></details></td></tr>';
         }
-        tbody.innerHTML = html || '<tr><td colspan="5" style="padding:14px;color:#909399;text-align:center">暂无请求，答题后这里会实时显示各渠道的发送与返回</td></tr>';
+        html = html || '<tr><td colspan="5" style="padding:14px;color:#909399;text-align:center">暂无请求，答题后这里会实时显示各渠道的发送与返回</td></tr>';
+        if (html !== rendered) {
+            tbody.innerHTML = html;
+            rendered = html;
+            tbody.querySelectorAll('details').forEach(function (el) { el.open = opened.has(el.dataset.item); });
+            scrolls.forEach(function (entry) {
+                var el = tbody.querySelector('details[data-item="' + entry[0] + '"] pre[data-field="' + entry[1] + '"]');
+                if (el) { el.scrollTop = entry[2]; el.scrollLeft = entry[3]; }
+            });
+            bodyBox.scrollTop = scrollTop;
+        }
         var s = api.summary();
-        statBox.innerHTML = '总请求 <em>' + s.total + '</em> · 成功 <em>' + s.ok + '</em> · 命中 <em>' + s.hit + '</em> · 平均耗时 <em>' + s.avg + 'ms</em>';
+        statBox.innerHTML = '总请求 <em>' + s.total + '</em> · 成功 <em>' + s.ok + '</em> · 命中 <em>' + s.hit + '</em> · 平均耗时 <em>' + s.avg + 'ms</em>' + (paused ? ' · 显示已暂停（答题独立运行）' : '');
     }
 
     function setOpen(open) {
@@ -4407,9 +4496,19 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
         var act = e.target && e.target.getAttribute && e.target.getAttribute('data-act');
         if (!act) return;
         e.stopPropagation();
-        if (act === 'clear') {
+        if (act === 'export') {
+            var blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), summary: api.summary(), items: api.items.map(exportItem) }, null, 2)], { type: 'application/json;charset=utf-8' });
+            var url = URL.createObjectURL(blob);
+            var link = doc.createElement('a');
+            link.href = url;
+            link.download = 'chaoxing-api-log-' + Date.now() + '.json';
+            doc.body.appendChild(link);
+            link.click();
+            link.remove();
+            setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+        } else if (act === 'clear') {
             api.clear();
-            render();
+            render(true);
         } else if (act === 'close') {
             setOpen(false);
         } else if (act === 'pause') {
@@ -4491,47 +4590,61 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
     var doc = window.document;
     if (!doc || !doc.head) return;
 
-    var KEY = 'dialogSize';
+    var KEY = 'mfDialogSizesV2';
     var MIN_W = 320;
     var MIN_H = 200;
-    var saved = null;
+    var saved = {};
     try {
-        if (typeof GM_getValue === 'function') saved = GM_getValue(KEY);
+        var stored = typeof GM_getValue === 'function' ? GM_getValue(KEY) : null;
+        saved = typeof stored === 'string' ? JSON.parse(stored) : stored || {};
     } catch (e) {
+        saved = {};
     }
-    if (saved && typeof saved === 'string') {
-        try {
-            saved = JSON.parse(saved);
-        } catch (e) {
-            saved = null;
-        }
-    }
-    if (saved && !(saved.w > 0)) saved = null;
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) saved = {};
+    var selector = '.el-dialog.mf-script-dialog';
 
     var style = doc.createElement('style');
     style.textContent = [
-        '.cs-resize-handle{position:absolute;right:0;bottom:0;width:18px;height:18px;cursor:nwse-resize;z-index:2147483647;background:transparent;}',
-        '.cs-resize-handle::after{content:"";position:absolute;right:3px;bottom:3px;width:10px;height:10px;border-right:2px solid #c0c4cc;border-bottom:2px solid #c0c4cc;border-radius:0 0 2px 0;opacity:.7;}',
-        '.cs-resize-handle:hover::after{border-color:#409eff;opacity:1;}',
-        '.el-dialog.cs-resized{overflow:auto!important;}'
+        '.mf-script-dialog.el-dialog{box-sizing:border-box;display:flex;flex-direction:column;width:var(--mf-dialog-width,680px)!important;max-width:calc(100vw - 24px)!important;height:var(--mf-dialog-height,auto);max-height:calc(100vh - 24px)!important;margin-top:12px!important;margin-bottom:12px!important;overflow:hidden}',
+        '.mf-task-dialog.el-dialog{width:var(--mf-dialog-width,760px)!important}',
+        '.mf-script-dialog>.el-dialog__header,.mf-script-dialog>.el-dialog__footer{flex-shrink:0}',
+        '.mf-script-dialog>.el-dialog__header{cursor:move;overflow-wrap:anywhere}',
+        '.mf-script-dialog>.el-dialog__body{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;padding:16px 20px}',
+        '.mf-script-dialog .dialog-footer{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}',
+        '.mf-script-dialog .el-form-item__content{min-width:0}.mf-script-dialog .el-input,.mf-script-dialog .el-select{max-width:100%}',
+        '.mf-script-dialog .el-tabs__content{min-width:0}.mf-script-dialog .el-tabs__item{padding:0 14px}',
+        '.mf-script-dialog>.cs-resize-handle{position:absolute;right:0;bottom:0;width:20px;height:20px;cursor:nwse-resize;z-index:1;touch-action:none}',
+        '.mf-script-dialog>.cs-resize-handle::after{content:"";position:absolute;right:3px;bottom:3px;width:10px;height:10px;border-right:2px solid #c0c4cc;border-bottom:2px solid #c0c4cc;border-radius:0 0 2px 0;opacity:.7}',
+        '.mf-script-dialog>.cs-resize-handle:hover::after{border-color:#409eff;opacity:1}'
     ].join('\n');
     doc.head.appendChild(style);
 
+    function sizeKey(dialog) {
+        return dialog.classList.contains('mf-task-dialog') ? 'task' : 'settings';
+    }
+    function clampSize(dialog, width, height) {
+        var maxW = Math.max(1, window.innerWidth - 24);
+        var maxH = Math.max(1, window.innerHeight - 24);
+        dialog.style.setProperty('--mf-dialog-width', Math.min(maxW, Math.max(Math.min(MIN_W, maxW), width)) + 'px');
+        if (height) dialog.style.setProperty('--mf-dialog-height', Math.min(maxH, Math.max(Math.min(MIN_H, maxH), height)) + 'px');
+        var rect = dialog.getBoundingClientRect();
+        if (rect.width && rect.height && (rect.left < 0 || rect.top < 0 || rect.right > window.innerWidth || rect.bottom > window.innerHeight)) dialog.style.transform = 'none';
+    }
     function applySize(dialog) {
-        if (!saved || !saved.w) return;
-        dialog.style.width = saved.w + 'px';
-        if (saved.h) dialog.style.height = saved.h + 'px';
-        dialog.classList.add('cs-resized');
+        var value = saved[sizeKey(dialog)];
+        if (value && Number.isFinite(value.w) && value.w > 0) clampSize(dialog, value.w, Number.isFinite(value.h) ? value.h : 0);
+        else clampSize(dialog, dialog.classList.contains('mf-task-dialog') ? 760 : 680, 0);
     }
 
     function persist() {
         try {
-            if (typeof GM_setValue === 'function') GM_setValue(KEY, saved ? JSON.stringify(saved) : '');
+            if (typeof GM_setValue === 'function') GM_setValue(KEY, JSON.stringify(saved));
         } catch (e) {
         }
     }
 
     function startResize(ev, dialog) {
+        if (ev.button !== 0) return;
         ev.preventDefault();
         ev.stopPropagation();
         var rect = dialog.getBoundingClientRect();
@@ -4541,19 +4654,14 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
         var startH = rect.height;
 
         function move(e2) {
-            var w = Math.max(MIN_W, Math.round(startW + e2.clientX - startX));
-            var h = Math.max(MIN_H, Math.round(startH + e2.clientY - startY));
-            dialog.style.width = w + 'px';
-            dialog.style.height = h + 'px';
-            dialog.style.maxHeight = 'none';
-            dialog.classList.add('cs-resized');
+            clampSize(dialog, Math.round(startW + e2.clientX - startX), Math.round(startH + e2.clientY - startY));
         }
 
         function up() {
             doc.removeEventListener('mousemove', move, true);
             doc.removeEventListener('mouseup', up, true);
             var r = dialog.getBoundingClientRect();
-            saved = { w: Math.round(r.width), h: Math.round(r.height) };
+            saved[sizeKey(dialog)] = { w: Math.round(r.width), h: Math.round(r.height) };
             persist();
         }
 
@@ -4573,11 +4681,10 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
         handle.addEventListener('dblclick', function (e) {
             e.stopPropagation();
             e.preventDefault();
-            dialog.style.width = '';
-            dialog.style.height = '';
-            dialog.style.maxHeight = '';
-            dialog.classList.remove('cs-resized');
-            saved = null;
+            dialog.style.removeProperty('--mf-dialog-width');
+            dialog.style.removeProperty('--mf-dialog-height');
+            delete saved[sizeKey(dialog)];
+            applySize(dialog);
             persist();
         });
         dialog.appendChild(handle);
@@ -4585,7 +4692,7 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
     }
 
     function scan() {
-        var list = doc.querySelectorAll('.el-dialog');
+        var list = doc.querySelectorAll(selector);
         for (var i = 0; i < list.length; i++) inject(list[i]);
     }
 
@@ -4596,6 +4703,9 @@ ${refs ? "其他同学的观点：\n" + refs + "\n" : ""}`;
         mo.observe(doc.body, { childList: true, subtree: true });
     } catch (e) {
     }
+    window.addEventListener('resize', function () {
+        doc.querySelectorAll(selector).forEach(applySize);
+    });
     if ('loading' === doc.readyState) doc.addEventListener('DOMContentLoaded', scan);
     else scan();
     setInterval(scan, 2000);
